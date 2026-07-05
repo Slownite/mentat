@@ -66,7 +66,7 @@ rows=$(wc -l < "$data")
 
 gp=$(mktemp)
 if [ -n "$FACET" ]; then
-    mkdir -p /tmp/mentat_facet
+    fdir=$(mktemp -d)
     vals=$(duckdb -csv -c "$($is_sqlite && sql_sqlite || echo "SELECT DISTINCT \"${FACET}\" FROM ${r}")" 2>/dev/null | tail -n +2)
     nv=$(echo "$vals" | wc -l); nc=2
     [ "$nv" -le 2 ] && nc=$nv; [ "$nv" -le 6 ] && nc=3; [ "$nv" -gt 6 ] && nc=4
@@ -81,13 +81,13 @@ G
     echo "$vals" | while IFS= read -r v; do
         vs=$(echo "$v" | tr ' ' '_' | tr -d '"')
         h1=$(head -1 "$data")
-        echo "$h1" > "/tmp/mentat_facet/${vs}.csv"
-        grep ",${v}$" "$data" >> "/tmp/mentat_facet/${vs}.csv" 2>/dev/null || true
-        [ -s "/tmp/mentat_facet/${vs}.csv" ] && [ "$(wc -l < "/tmp/mentat_facet/${vs}.csv")" -gt 1 ] || continue
-        echo "plot '/tmp/mentat_facet/${vs}.csv' using 1:2 every ::1 with boxes lc rgb '#4A90D9'" >> "$gp"
+        echo "$h1" > "${fdir}/${vs}.csv"
+        grep ",${v}$" "$data" >> "${fdir}/${vs}.csv" 2>/dev/null || true
+        [ -s "${fdir}/${vs}.csv" ] && [ "$(wc -l < "${fdir}/${vs}.csv")" -gt 1 ] || continue
+        echo "plot '${fdir}/${vs}.csv' using 1:2 every ::1 with boxes lc rgb '#4A90D9'" >> "$gp"
     done
     echo "unset multiplot" >> "$gp"
-    rm -rf /tmp/mentat_facet
+    rm -rf "$fdir"
 else
     cat > "$gp" <<G
 set terminal pngcairo enhanced font 'sans,10' size 800,600
