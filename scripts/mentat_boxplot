@@ -23,7 +23,8 @@ EOF
 [ "$#" -eq 0 ] || [ "$1" = "--help" ] && { usage; exit 0; }
 
 DATASOURCE=""; CAT=""; VAL=""; O="./mentat_boxplot.png"; A=false
-FACET=""; TITLE="Boxplot"; XL="Category"; YL="Value"; TBL=""
+FACET=""; TITLE="Boxplot"; XL="$CAT"; YL="$VAL"; TBL=""
+XL_SET=false; YL_SET=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -31,8 +32,8 @@ while [ "$#" -gt 0 ]; do
         --ascii) A=true; shift ;;
         --facet) FACET="$2"; shift 2 ;;
         --title) TITLE="$2"; shift 2 ;;
-        --xlabel) XL="$2"; shift 2 ;;
-        --ylabel) YL="$2"; shift 2 ;;
+        --xlabel) XL="$2"; XL_SET=true; shift 2 ;;
+        --ylabel) YL="$2"; YL_SET=true; shift 2 ;;
         --table) TBL="$2"; shift 2 ;;
         *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
            [ -z "$CAT" ] && CAT="$1" && shift && continue
@@ -42,6 +43,8 @@ done
 [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
 [ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
 [ -z "$VAL" ] && echo "ERROR: value_col required" >&2 && exit 1
+$XL_SET || XL="$CAT"
+$YL_SET || YL="$VAL"
 
 ext="${DATASOURCE##*.}"
 is_sqlite=false; [ "$ext" = "sqlite" ] || [ "$ext" = "db" ] && is_sqlite=true
@@ -51,8 +54,10 @@ sql_flat() { echo "SELECT CAST(\"${CAT}\" AS VARCHAR) AS cat,CAST(\"${VAL}\" AS 
 sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(sql_flat "_d.\"${TBL}\"" | tail -1)"; }
 
 data=".mentat_data_$$.csv"
+sql=""
 if $is_sqlite; then
-    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
+    sql=$(sql_sqlite)
+    duckdb -csv -c "$sql" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 else
     case "$ext" in
         csv) r="read_csv_auto('${DATASOURCE}')" ;;
@@ -60,10 +65,16 @@ else
         json) r="read_json_auto('${DATASOURCE}')" ;;
         *) echo "ERROR: .${ext} unsupported" >&2; exit 1 ;;
     esac
-    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
+    sql=$(sql_flat "$r")
+    duckdb -csv -c "$sql" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 fi
 
-rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && {
+    echo "ERROR: plot returned $((rows-1)) data rows (need >=2)" >&2
+    echo "SQL: $sql" >&2
+    echo "Tip: Check CAST failures — \"$VAL\" must be numeric, \"$CAT\" must be a category" >&2
+    exit 1
+}
 
 gp=".mentat_gp_$$.gp"
 cat > "$gp" <<G
@@ -71,15 +82,17 @@ set terminal pngcairo enhanced font 'sans,10' size 800,600
 set output '${O}'; set datafile separator comma; set key off
 set style data boxplot; set style boxplot outliers pointtype 7
 set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"; set xtics rotate by -45
-plot '${data}' using 2:1:${CAT}:xtic(1) every ::1 with boxplot lc rgb '#4A90D9'
-G
-gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; exit 1; }
-echo "saved: ${O}"
-
-$A && { cat > "$gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
-set style data boxplot
 plot '${data}' using 2:1:xtic(1) every ::1 with boxplot lc rgb '#4A90D9'
 G
-gnuplot "$gp" 2>/dev/null || true; }
+gnuplot "$gp" || { echo "ERROR: gnuplot failed" >&2; exit 1; }
+echo "saved: ${O}"
 
-: # cleaned by trap
+$A && {
+    ascii_gp=".mentat_ascii_$$.gp"
+    cat > "$ascii_gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
+set style data boxplot
+set xlabel "${XL}"; set ylabel "${YL}"
+plot '${data}' using 2:1:xtic(1) every ::1 with boxplot lc rgb '#4A90D9'
+G
+    gnuplot "$ascii_gp" || true; rm -f "$ascii_gp"
+}

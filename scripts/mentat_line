@@ -24,7 +24,8 @@ EOF
 [ "$#" -eq 0 ] || [ "$1" = "--help" ] && { usage; exit 0; }
 
 DATASOURCE=""; TC=""; VC=""; O="./mentat_line.png"; A=false
-BUCKET="auto"; FACET=""; TITLE="Line Chart"; XL="Time"; YL="Value"; TBL=""
+BUCKET="auto"; FACET=""; TITLE="Line Chart"; XL="$TC"; YL="$VC"; TBL=""
+XL_SET=false; YL_SET=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -33,8 +34,8 @@ while [ "$#" -gt 0 ]; do
         --bucket) BUCKET="$2"; shift 2 ;;
         --facet) FACET="$2"; shift 2 ;;
         --title) TITLE="$2"; shift 2 ;;
-        --xlabel) XL="$2"; shift 2 ;;
-        --ylabel) YL="$2"; shift 2 ;;
+        --xlabel) XL="$2"; XL_SET=true; shift 2 ;;
+        --ylabel) YL="$2"; YL_SET=true; shift 2 ;;
         --table) TBL="$2"; shift 2 ;;
         *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
            [ -z "$TC" ] && TC="$1" && shift && continue
@@ -44,6 +45,8 @@ done
 [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
 [ -z "$TC" ] && echo "ERROR: time_col required" >&2 && exit 1
 [ -z "$VC" ] && echo "ERROR: value_col required" >&2 && exit 1
+$XL_SET || XL="$TC"
+$YL_SET || YL="$VC"
 
 ext="${DATASOURCE##*.}"
 is_sqlite=false; [ "$ext" = "sqlite" ] || [ "$ext" = "db" ] && is_sqlite=true
@@ -73,8 +76,10 @@ sql_flat() {
 sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(echo "$(sql_flat "_d.\"${TBL}\"")" | sed 's/DATE_TRUNC/date_trunc/g')"; }
 
 data=".mentat_data_$$.csv"
+sql=""
 if $is_sqlite; then
-    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
+    sql=$(sql_sqlite)
+    duckdb -csv -c "$sql" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 else
     case "$ext" in
         csv) r="read_csv_auto('${DATASOURCE}')" ;;
@@ -82,11 +87,16 @@ else
         json) r="read_json_auto('${DATASOURCE}')" ;;
         *) echo "ERROR: .${ext} unsupported" >&2; exit 1 ;;
     esac
-    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
+    sql=$(sql_flat "$r")
+    duckdb -csv -c "$sql" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 fi
 
-rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-echo "# gaps filled with zeros"
+rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && {
+    echo "ERROR: plot returned $((rows-1)) data rows (need >=2)" >&2
+    echo "SQL: $sql" >&2
+    echo "Tip: Check CAST failures — string columns can't be plotted as numeric" >&2
+    exit 1
+}
 
 gp=".mentat_gp_$$.gp"
 cat > "$gp" <<G
@@ -96,13 +106,15 @@ set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"
 set xdata time; set timefmt "%Y-%m-%d %H:%M:%S"; set format x "%Y-%m-%d"; set grid
 plot '${data}' using 1:2 every ::1 with lines lw 2 lc rgb '#4A90D9'
 G
-gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; exit 1; }
+gnuplot "$gp" || { echo "ERROR: gnuplot failed" >&2; exit 1; }
 echo "saved: ${O}"
 
-$A && { cat > "$gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
+$A && {
+    ascii_gp=".mentat_ascii_$$.gp"
+    cat > "$ascii_gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
 set xdata time; set timefmt "%Y-%m-%d %H:%M:%S"; set format x "%m-%d"
+set xlabel "${XL}"; set ylabel "${YL}"
 plot '${data}' using 1:2 every ::1 with lines lw 2
 G
-gnuplot "$gp" 2>/dev/null || true; }
-
-: # cleaned by trap
+    gnuplot "$ascii_gp" || true; rm -f "$ascii_gp"
+}
