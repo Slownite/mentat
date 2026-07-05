@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: mentat_histogram <datasource> <column> [flags]
+
+Render a histogram.
+
+Flags:
+  -o, --output PATH   PNG output (default: ./mentat_histogram.png)
+  --ascii             Print ASCII preview to stdout
+  --bins N            Number of bins (default: 20)
+  --facet COL         Multi-panel by this column
+  --table NAME        Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help
+EOF
+}
+
+[ "$#" -eq 0 ] || [ "$1" = "--help" ] && { usage; exit 0; }
+
+DATASOURCE=""; C=""; O="./mentat_histogram.png"; A=false
+BINS=20; FACET=""; TITLE="Histogram"; XL="Value"; YL="Count"; TBL=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output) O="$2"; shift 2 ;;
+        --ascii) A=true; shift ;;
+        --bins) BINS="$2"; shift 2 ;;
+        --facet) FACET="$2"; shift 2 ;;
+        --title) TITLE="$2"; shift 2 ;;
+        --xlabel) XL="$2"; shift 2 ;;
+        --ylabel) YL="$2"; shift 2 ;;
+        --table) TBL="$2"; shift 2 ;;
+        *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+           [ -z "$C" ] && C="$1" && shift || break ;;
+    esac
+done
+[ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+[ -z "$C" ] && echo "ERROR: column required" >&2 && exit 1
+
+ext="${DATASOURCE##*.}"
+is_sqlite=false; [ "$ext" = "sqlite" ] || [ "$ext" = "db" ] && is_sqlite=true
+c="\"${C}\""
+
+sql_flat() { echo "WITH s AS(SELECT MIN(CAST($c AS DOUBLE))AS mn,MAX(CAST($c AS DOUBLE))AS mx FROM $1 WHERE $c IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST($c AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,COUNT(*)AS n FROM $1,s WHERE $c IS NOT NULL GROUP BY b ORDER BY b"; }
+
+sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(sql_flat "_d.\"${TBL}\"" | tail -1)"; }
+
+data=$(mktemp)
+if $is_sqlite; then
+    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+else
+    case "$ext" in
+        csv) r="read_csv_auto('${DATASOURCE}')" ;;
+        parquet) r="'${DATASOURCE}'" ;;
+        json) r="read_json_auto('${DATASOURCE}')" ;;
+        *) echo "ERROR: .${ext} unsupported" >&2; rm "$data"; exit 1 ;;
+    esac
+    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+fi
+
+rows=$(wc -l < "$data")
+[ "$rows" -le 1 ] && echo "ERROR: no data for histogram" >&2 && rm "$data" && exit 1
+
+gp=$(mktemp)
+if [ -n "$FACET" ]; then
+    mkdir -p /tmp/mentat_facet
+    vals=$(duckdb -csv -c "$($is_sqlite && sql_sqlite || echo "SELECT DISTINCT \"${FACET}\" FROM ${r}")" 2>/dev/null | tail -n +2)
+    nv=$(echo "$vals" | wc -l); nc=2
+    [ "$nv" -le 2 ] && nc=$nv; [ "$nv" -le 6 ] && nc=3; [ "$nv" -gt 6 ] && nc=4
+    nr=$(((nv+nc-1)/nc))
+    cat > "$gp" <<G
+set terminal pngcairo enhanced font 'sans,10' size 800,600
+set output '${O}'
+set datafile separator comma
+set multiplot layout ${nr},${nc} title "${TITLE} (faceted by ${FACET})"
+set boxwidth 0.8 relative; set style fill solid; set key off
+G
+    echo "$vals" | while IFS= read -r v; do
+        vs=$(echo "$v" | tr ' ' '_' | tr -d '"')
+        h1=$(head -1 "$data")
+        echo "$h1" > "/tmp/mentat_facet/${vs}.csv"
+        grep ",${v}$" "$data" >> "/tmp/mentat_facet/${vs}.csv" 2>/dev/null || true
+        [ -s "/tmp/mentat_facet/${vs}.csv" ] && [ "$(wc -l < "/tmp/mentat_facet/${vs}.csv")" -gt 1 ] || continue
+        echo "plot '/tmp/mentat_facet/${vs}.csv' using 1:2 every ::1 with boxes lc rgb '#4A90D9'" >> "$gp"
+    done
+    echo "unset multiplot" >> "$gp"
+    rm -rf /tmp/mentat_facet
+else
+    cat > "$gp" <<G
+set terminal pngcairo enhanced font 'sans,10' size 800,600
+set output '${O}'
+set datafile separator comma
+set boxwidth 0.8 relative; set style fill solid; set key off
+set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"
+plot '${data}' using 1:2 every ::1 with boxes lc rgb '#4A90D9'
+G
+fi
+
+gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; rm "$gp" "$data"; exit 1; }
+echo "saved: ${O}"
+
+$A && { cat > "$gp" <<G
+set terminal dumb 80 25; set datafile separator comma; set key off
+plot '${data}' using 1:2 every ::1 with boxes lc rgb '#4A90D9'
+G
+gnuplot "$gp" 2>/dev/null || true; }
+
+rm "$gp" "$data"

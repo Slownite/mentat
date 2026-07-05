@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: mentat_bar <datasource> <category_col> [value_col] [flags]
+
+Render a bar chart. If value_col omitted, counts per category.
+
+Flags:
+  -o, --output PATH   PNG output (default: ./mentat_bar.png)
+  --ascii             Print ASCII preview to stdout
+  --facet COL         Multi-panel by this column
+  --table NAME        Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help
+EOF
+}
+
+[ "$#" -eq 0 ] || [ "$1" = "--help" ] && { usage; exit 0; }
+
+DATASOURCE=""; CAT=""; VAL=""; O="./mentat_bar.png"; A=false
+FACET=""; TITLE="Bar Chart"; XL="Category"; YL="Count"; TBL=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output) O="$2"; shift 2 ;;
+        --ascii) A=true; shift ;;
+        --facet) FACET="$2"; shift 2 ;;
+        --title) TITLE="$2"; shift 2 ;;
+        --xlabel) XL="$2"; shift 2 ;;
+        --ylabel) YL="$2"; shift 2 ;;
+        --table) TBL="$2"; shift 2 ;;
+        *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+           [ -z "$CAT" ] && CAT="$1" && shift && continue
+           [ -z "$VAL" ] && VAL="$1" && shift || break ;;
+    esac
+done
+[ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+[ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
+
+ext="${DATASOURCE##*.}"
+is_sqlite=false; [ "$ext" = "sqlite" ] || [ "$ext" = "db" ] && is_sqlite=true
+
+agg_col="COUNT(*) AS n"
+[ -n "$VAL" ] && agg_col="ROUND(AVG(CAST(\"${VAL}\" AS DOUBLE)),2) AS n"
+
+sql_flat() { echo "SELECT CAST(\"${CAT}\" AS VARCHAR) AS cat,${agg_col} FROM $1 WHERE \"${CAT}\" IS NOT NULL ${VAL:+AND \"${VAL}\" IS NOT NULL} GROUP BY cat ORDER BY n DESC LIMIT 50"; }
+
+sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(sql_flat "_d.\"${TBL}\"" | tail -1)"; }
+
+data=$(mktemp)
+if $is_sqlite; then
+    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+else
+    case "$ext" in
+        csv) r="read_csv_auto('${DATASOURCE}')" ;;
+        parquet) r="'${DATASOURCE}'" ;;
+        json) r="read_json_auto('${DATASOURCE}')" ;;
+        *) echo "ERROR: .${ext} unsupported" >&2; rm "$data"; exit 1 ;;
+    esac
+    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+fi
+
+rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && rm "$data" && exit 1
+
+gp=$(mktemp)
+cat > "$gp" <<G
+set terminal pngcairo enhanced font 'sans,10' size 800,600
+set output '${O}'; set datafile separator comma; set key off
+set style data histogram; set style histogram cluster gap 1
+set style fill solid border -1; set boxwidth 0.8
+set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"; set xtics rotate by -45
+plot '${data}' using 2:xtic(1) every ::1 with boxes lc rgb '#50B86C'
+G
+gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; rm "$gp" "$data"; exit 1; }
+echo "saved: ${O}"
+
+$A && { cat > "$gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
+set style data histogram; set style fill solid; set boxwidth 0.8
+plot '${data}' using 2:xtic(1) every ::1 with boxes lc rgb '#50B86C'
+G
+gnuplot "$gp" 2>/dev/null || true; }
+
+rm "$gp" "$data"

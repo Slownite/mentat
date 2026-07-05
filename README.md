@@ -80,14 +80,19 @@ Show me a histogram of transaction amounts faceted by region.
 
 ## CLI
 
-Mentat provides four helper scripts that the agent invokes during analysis:
+Mentat provides helper scripts that the agent invokes during analysis:
 
 | Script | Purpose |
 |--------|---------|
 | `mentat_selfcheck` | Validate required dependencies (DuckDB, QSV, Gnuplot) |
 | `mentat_inspect` | Discover schema from CSV, Parquet, JSON, or SQLite sources |
 | `mentat_query` | Execute SQL via DuckDB and return stats-enriched results |
-| `mentat_plot` | Render visualizations via Gnuplot (histogram, scatter, line, bar, boxplot, heatmap, facet) |
+| `mentat_histogram` | Histogram (distribution of 1 numeric column) |
+| `mentat_scatter` | Scatter plot (correlation of 2 numeric columns) |
+| `mentat_line` | Line chart (time-series trend) |
+| `mentat_bar` | Bar chart (categorical frequencies) |
+| `mentat_boxplot` | Box plot (categorical vs numeric comparison) |
+| `mentat_heatmap` | Heatmap (2D density / cross-tabulation) |
 
 Each script supports `--help` for full flag documentation.
 
@@ -112,11 +117,17 @@ Settings are read from (in priority order):
 ```
 mentat/
 ├── SKILL.md                    # Agent instructions
+├── REFERENCE.md                # Edge case reference
 ├── scripts/                    # Helper scripts
 │   ├── mentat_selfcheck        # Dependency validation
 │   ├── mentat_inspect          # Schema discovery (Phase 1 + 2)
 │   ├── mentat_query            # SQL execution + stats
-│   └── mentat_plot             # Gnuplot rendering
+│   ├── mentat_histogram        # Histogram chart
+│   ├── mentat_scatter          # Scatter chart
+│   ├── mentat_line             # Line chart
+│   ├── mentat_bar              # Bar chart
+│   ├── mentat_boxplot          # Box plot
+│   └── mentat_heatmap          # Heatmap
 ├── config.example              # Example configuration
 ├── flake.nix                   # Nix flake
 ├── modules/

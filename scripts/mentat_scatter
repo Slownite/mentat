@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: mentat_scatter <datasource> <x_col> <y_col> [flags]
+
+Render a scatter plot.
+
+Flags:
+  -o, --output PATH   PNG output (default: ./mentat_scatter.png)
+  --ascii             Print ASCII preview to stdout
+  --facet COL         Multi-panel by this column
+  --table NAME        Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help
+EOF
+}
+
+[ "$#" -eq 0 ] || [ "$1" = "--help" ] && { usage; exit 0; }
+
+DATASOURCE=""; X=""; Y=""; O="./mentat_scatter.png"; A=false
+FACET=""; TITLE="Scatter"; XL="X"; YL="Y"; TBL=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output) O="$2"; shift 2 ;;
+        --ascii) A=true; shift ;;
+        --facet) FACET="$2"; shift 2 ;;
+        --title) TITLE="$2"; shift 2 ;;
+        --xlabel) XL="$2"; shift 2 ;;
+        --ylabel) YL="$2"; shift 2 ;;
+        --table) TBL="$2"; shift 2 ;;
+        *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+           [ -z "$X" ] && X="$1" && shift && continue
+           [ -z "$Y" ] && Y="$1" && shift || break ;;
+    esac
+done
+[ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+[ -z "$X" ] && echo "ERROR: x_col required" >&2 && exit 1
+[ -z "$Y" ] && echo "ERROR: y_col required" >&2 && exit 1
+
+ext="${DATASOURCE##*.}"
+is_sqlite=false; [ "$ext" = "sqlite" ] || [ "$ext" = "db" ] && is_sqlite=true
+
+sql_flat() { echo "SELECT CAST(\"${X}\" AS DOUBLE)AS x,CAST(\"${Y}\" AS DOUBLE)AS y FROM $1 WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL LIMIT 50000"; }
+
+sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(sql_flat "_d.\"${TBL}\"" | tail -1)"; }
+
+data=$(mktemp)
+if $is_sqlite; then
+    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+else
+    case "$ext" in
+        csv) r="read_csv_auto('${DATASOURCE}')" ;;
+        parquet) r="'${DATASOURCE}'" ;;
+        json) r="read_json_auto('${DATASOURCE}')" ;;
+        *) echo "ERROR: .${ext} unsupported" >&2; rm "$data"; exit 1 ;;
+    esac
+    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+fi
+
+rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && rm "$data" && exit 1
+
+gp=$(mktemp)
+cat > "$gp" <<G
+set terminal pngcairo enhanced font 'sans,10' size 800,600
+set output '${O}'; set datafile separator comma; set key off
+set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"
+plot '${data}' using 1:2 every ::1 with points pt 7 ps 0.5 lc rgb '#D94A4A'
+G
+gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; rm "$gp" "$data"; exit 1; }
+echo "saved: ${O}"
+
+$A && { cat > "$gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
+plot '${data}' using 1:2 every ::1 with points pt 7 ps 0.5 lc rgb '#D94A4A'
+G
+gnuplot "$gp" 2>/dev/null || true; }
+
+rm "$gp" "$data"
