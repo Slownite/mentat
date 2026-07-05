@@ -19,11 +19,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y duckdb gnuplot bats bc
-          mkdir -p /tmp/qsv
+          sudo apt-get install -y gnuplot bats bc
+
+          DUCKDB_VERSION=$(curl -s https://api.github.com/repos/duckdb/duckdb/releases/latest | grep tag_name | cut -d'"' -f4)
+          curl -sL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip
+          unzip -o /tmp/duckdb.zip -d /tmp/duckdb
+          chmod +x /tmp/duckdb/duckdb
+          sudo mv /tmp/duckdb/duckdb /usr/local/bin/duckdb
+
           QSV_VERSION=$(curl -s https://api.github.com/repos/jqnatividad/qsv/releases/latest | grep tag_name | cut -d'"' -f4)
-          curl -sL "https://github.com/jqnatividad/qsv/releases/download/${QSV_VERSION}/qsv-${QSV_VERSION}-x86_64-unknown-linux-gnu.zip" -o /tmp/qsv/qsv.zip
-          unzip -o /tmp/qsv/qsv.zip -d /tmp/qsv
+          curl -sL "https://github.com/jqnatividad/qsv/releases/download/${QSV_VERSION}/qsv-${QSV_VERSION}-x86_64-unknown-linux-gnu.zip" -o /tmp/qsv.zip
+          unzip -o /tmp/qsv.zip -d /tmp/qsv
           chmod +x /tmp/qsv/qsv
           sudo mv /tmp/qsv/qsv /usr/local/bin/qsv
 
