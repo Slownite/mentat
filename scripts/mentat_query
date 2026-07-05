@@ -138,17 +138,10 @@ run_query() {
     fi
 }
 
-TIMEOUT_SEC=30
-
 # Raw mode: just return rows
 if $RAW; then
     dsql=$(build_duckdb_sql "$SQL")
-    output=$(timeout "$TIMEOUT_SEC" run_query "$dsql" "csv" 2>&1) || {
-        exit_code=$?
-        if [ $exit_code -eq 124 ]; then
-            echo "ERROR: Query timed out after ${TIMEOUT_SEC}s. Consider adding WHERE clauses or LIMIT."
-            exit 2
-        fi
+    output=$(run_query "$dsql" "csv" 2>&1) || {
         echo "ERROR: $output"
         exit 1
     }
@@ -160,12 +153,7 @@ fi
 
 # Get query results as CSV
 dsql=$(build_duckdb_sql "$SQL")
-result=$(timeout "$TIMEOUT_SEC" run_query "$dsql" "csv" 2>&1) || {
-    exit_code=$?
-    if [ $exit_code -eq 124 ]; then
-        echo "ERROR: Query timed out after ${TIMEOUT_SEC}s. Consider adding WHERE clauses or LIMIT."
-        exit 2
-    fi
+result=$(run_query "$dsql" "csv" 2>&1) || {
     echo "ERROR: $result"
     exit 1
 }

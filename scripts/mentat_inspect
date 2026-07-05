@@ -164,67 +164,6 @@ case "$ext" in
         fi
 
         table_count=$(echo "$tables" | tail -n +2 | wc -l)
-        fk_count=0
-        tables_output=""
-
-        # Process each table
-        echo "$tables" | tail -n +2 | while IFS=',' read -r tname ttype; do
-            tname=$(echo "$tname" | xargs)
-            ttype=$(echo "$ttype" | xargs)
-
-            # Get column info via DESCRIBE
-            desc_output=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); DESCRIBE _db.\"${tname}\";" 2>/dev/null) || {
-                continue
-            }
-
-            # Get CREATE TABLE SQL for FK detection
-            create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT sql FROM _db.sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
-
-            # Build column list
-            col_parts=""
-            echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
-                cname=$(echo "$cname" | xargs)
-                ctype=$(echo "$ctype" | xargs)
-                ckey=$(echo "$ckey" | xargs)
-
-                # Detect PK
-                if [ "$ckey" = "PRI" ]; then
-                    ctype="${ctype} PK"
-                fi
-
-                # Detect inline FK via REFERENCES in CREATE TABLE SQL
-                if [ -n "$create_sql" ]; then
-                    col_def=$(echo "$create_sql" | grep -oE "\"${cname}\"[^,)]*" | head -1 || echo "")
-                    if echo "$col_def" | grep -qi "REFERENCES"; then
-                        ref_part=$(echo "$col_def" | sed 's/.*REFERENCES[[:space:]]*//i' | tr '(' ' ' | tr -d '")' | xargs)
-                        ref_table=$(echo "$ref_part" | awk '{print $1}' 2>/dev/null || echo "")
-                        ref_col=$(echo "$ref_part" | awk '{print $2}' 2>/dev/null || echo "")
-                        if [ -n "$ref_table" ] && [ -n "$ref_col" ]; then
-                            ctype="${ctype} FK->${ref_table}.${ref_col}"
-                        fi
-                    fi
-                fi
-
-                col_parts="${col_parts}${cname} ${ctype}, "
-            done
-
-            # Detect explicit FK constraints
-            has_explicit_fk=false
-            if [ -n "$create_sql" ]; then
-                if echo "$create_sql" | grep -qi "FOREIGN KEY"; then
-                    has_explicit_fk=true
-                fi
-            fi
-
-            # Build the table DDL line
-            col_line=$(echo "$col_parts" | sed 's/, $//')
-            echo "${tname}(${col_line})"
-
-            # Note explicit FKs
-            if $has_explicit_fk; then
-                echo "  -- has explicit FOREIGN KEY constraints"
-            fi
-        done
 
         # Count FKs for header
         fk_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM _db.sqlite_master WHERE type='table' AND sql LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
@@ -242,7 +181,7 @@ case "$ext" in
                 desc_output=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); DESCRIBE _db.\"${tname}\";" 2>/dev/null) || continue
                 create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT sql FROM _db.sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
                 col_parts=""
-                echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+                while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
                     cname=$(echo "$cname" | xargs)
                     ctype=$(echo "$ctype" | xargs)
                     ckey=$(echo "$ckey" | xargs)
@@ -259,7 +198,7 @@ case "$ext" in
                         fi
                     fi
                     col_parts="${col_parts}${cname} ${ctype}, "
-                done
+                done <<< "$(echo "$desc_output" | tail -n +2)"
                 col_line=$(echo "$col_parts" | sed 's/, $//')
                 echo "${tname}(${col_line})"
             done
@@ -275,11 +214,11 @@ case "$ext" in
         }
         col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
         col_parts=""
-        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+        while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
             cname=$(echo "$cname" | xargs)
             ctype=$(echo "$ctype" | xargs)
             col_parts="${col_parts}${cname} ${ctype}, "
-        done
+        done <<< "$(echo "$desc_output" | tail -n +2)"
         col_line=$(echo "$col_parts" | sed 's/, $//')
         echo "-- ${filename} (${col_count} columns)"
         echo "${tablename}(${col_line})"
@@ -291,11 +230,11 @@ case "$ext" in
         }
         col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
         col_parts=""
-        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+        while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
             cname=$(echo "$cname" | xargs)
             ctype=$(echo "$ctype" | xargs)
             col_parts="${col_parts}${cname} ${ctype}, "
-        done
+        done <<< "$(echo "$desc_output" | tail -n +2)"
         col_line=$(echo "$col_parts" | sed 's/, $//')
         echo "-- ${filename} (${col_count} columns)"
         echo "${tablename}(${col_line})"
@@ -307,11 +246,11 @@ case "$ext" in
         }
         col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
         col_parts=""
-        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+        while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
             cname=$(echo "$cname" | xargs)
             ctype=$(echo "$ctype" | xargs)
             col_parts="${col_parts}${cname} ${ctype}, "
-        done
+        done <<< "$(echo "$desc_output" | tail -n +2)"
         col_line=$(echo "$col_parts" | sed 's/, $//')
         echo "-- ${filename} (${col_count} columns)"
 

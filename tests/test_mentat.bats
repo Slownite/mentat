@@ -37,7 +37,7 @@ teardown() {
 }
 
 @test "mentat_inspect returns schema for SQLite" {
-    duckdb test.sqlite -c "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER); CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount REAL);" 2>/dev/null
+    duckdb -c "ATTACH 'test.sqlite' AS _sql (TYPE SQLITE); CREATE TABLE _sql.users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER); CREATE TABLE _sql.orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);" 2>/dev/null
     run "$SCRIPTS_DIR/mentat_inspect" test.sqlite
     [ "$status" -eq 0 ]
     [[ "$output" =~ "users" ]]
@@ -53,7 +53,7 @@ teardown() {
 }
 
 @test "mentat_inspect handles empty SQLite database" {
-    duckdb empty.sqlite "SELECT 1;" 2>/dev/null
+    duckdb -c "ATTACH 'empty.sqlite' AS _empty (TYPE SQLITE);" 2>/dev/null
     run "$SCRIPTS_DIR/mentat_inspect" empty.sqlite
     [ "$status" -eq 1 ]
     [[ "$output" =~ "no tables" ]]
