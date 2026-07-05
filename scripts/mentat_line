@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cleanup() { rm -f ".mentat_data_$$.csv" ".mentat_gp_$$.gp"; }
+trap cleanup EXIT
+
 usage() {
     cat <<EOF
 Usage: mentat_line <datasource> <time_col> <value_col> [flags]
@@ -69,23 +72,23 @@ sql_flat() {
 
 sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(echo "$(sql_flat "_d.\"${TBL}\"")" | sed 's/DATE_TRUNC/date_trunc/g')"; }
 
-data=$(mktemp)
+data=".mentat_data_$$.csv"
 if $is_sqlite; then
-    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 else
     case "$ext" in
         csv) r="read_csv_auto('${DATASOURCE}')" ;;
         parquet) r="'${DATASOURCE}'" ;;
         json) r="read_json_auto('${DATASOURCE}')" ;;
-        *) echo "ERROR: .${ext} unsupported" >&2; rm "$data"; exit 1 ;;
+        *) echo "ERROR: .${ext} unsupported" >&2; exit 1 ;;
     esac
-    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 fi
 
-rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && rm "$data" && exit 1
+rows=$(wc -l < "$data"); [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
 echo "# gaps filled with zeros"
 
-gp=$(mktemp)
+gp=".mentat_gp_$$.gp"
 cat > "$gp" <<G
 set terminal pngcairo enhanced font 'sans,10' size 800,600
 set output '${O}'; set datafile separator comma; set key off
@@ -93,7 +96,7 @@ set title "${TITLE}"; set xlabel "${XL}"; set ylabel "${YL}"
 set xdata time; set timefmt "%Y-%m-%d %H:%M:%S"; set format x "%Y-%m-%d"; set grid
 plot '${data}' using 1:2 every ::1 with lines lw 2 lc rgb '#4A90D9'
 G
-gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; rm "$gp" "$data"; exit 1; }
+gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; exit 1; }
 echo "saved: ${O}"
 
 $A && { cat > "$gp" <<G; set terminal dumb 80 25; set datafile separator comma; set key off
@@ -102,4 +105,4 @@ plot '${data}' using 1:2 every ::1 with lines lw 2
 G
 gnuplot "$gp" 2>/dev/null || true; }
 
-rm "$gp" "$data"
+: # cleaned by trap

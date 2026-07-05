@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cleanup() { rm -f ".mentat_data_$$.csv" ".mentat_gp_$$.gp"; rm -rf ".mentat_fdir_$$"; }
+trap cleanup EXIT
+
 usage() {
     cat <<EOF
 Usage: mentat_histogram <datasource> <column> [flags]
@@ -48,25 +51,25 @@ sql_flat() { echo "WITH s AS(SELECT MIN(CAST($c AS DOUBLE))AS mn,MAX(CAST($c AS 
 
 sql_sqlite() { [ -z "$TBL" ] && echo "ERROR: --table required" >&2 && exit 1; echo "ATTACH '${DATASOURCE}' AS _d(TYPE SQLITE,READ_ONLY);$(sql_flat "_d.\"${TBL}\"" | tail -1)"; }
 
-data=$(mktemp)
+data=".mentat_data_$$.csv"
 if $is_sqlite; then
-    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+    duckdb -csv -c "$(sql_sqlite)" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 else
     case "$ext" in
         csv) r="read_csv_auto('${DATASOURCE}')" ;;
         parquet) r="'${DATASOURCE}'" ;;
         json) r="read_json_auto('${DATASOURCE}')" ;;
-        *) echo "ERROR: .${ext} unsupported" >&2; rm "$data"; exit 1 ;;
+        *) echo "ERROR: .${ext} unsupported" >&2; exit 1 ;;
     esac
-    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; rm "$data"; exit 1; }
+    duckdb -csv -c "$(sql_flat "$r")" > "$data" 2>&1 || { echo "ERROR: duckdb failed" >&2; cat "$data" >&2; exit 1; }
 fi
 
 rows=$(wc -l < "$data")
-[ "$rows" -le 1 ] && echo "ERROR: no data for histogram" >&2 && rm "$data" && exit 1
+[ "$rows" -le 1 ] && echo "ERROR: no data for histogram" >&2 && exit 1
 
-gp=$(mktemp)
+gp=".mentat_gp_$$.gp"
 if [ -n "$FACET" ]; then
-    fdir=$(mktemp -d)
+    fdir=".mentat_fdir_$$"
     vals=$(duckdb -csv -c "$($is_sqlite && sql_sqlite || echo "SELECT DISTINCT \"${FACET}\" FROM ${r}")" 2>/dev/null | tail -n +2)
     nv=$(echo "$vals" | wc -l); nc=2
     [ "$nv" -le 2 ] && nc=$nv; [ "$nv" -le 6 ] && nc=3; [ "$nv" -gt 6 ] && nc=4
@@ -87,7 +90,7 @@ G
         echo "plot '${fdir}/${vs}.csv' using 1:2 every ::1 with boxes lc rgb '#4A90D9'" >> "$gp"
     done
     echo "unset multiplot" >> "$gp"
-    rm -rf "$fdir"
+    :
 else
     cat > "$gp" <<G
 set terminal pngcairo enhanced font 'sans,10' size 800,600
@@ -99,7 +102,7 @@ plot '${data}' using 1:2 every ::1 with boxes lc rgb '#4A90D9'
 G
 fi
 
-gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; rm "$gp" "$data"; exit 1; }
+gnuplot "$gp" 2>/dev/null || { echo "ERROR: gnuplot failed" >&2; exit 1; }
 echo "saved: ${O}"
 
 $A && { cat > "$gp" <<G
@@ -108,4 +111,4 @@ plot '${data}' using 1:2 every ::1 with boxes lc rgb '#4A90D9'
 G
 gnuplot "$gp" 2>/dev/null || true; }
 
-rm "$gp" "$data"
+: # cleaned by trap
