@@ -120,30 +120,31 @@ GNUPLOT_SCRIPT=$(mktemp)
 
 write_histogram_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
-set style data histogram
-set style histogram cluster gap 1
+set datafile separator comma
+set boxwidth 0.8 relative
 set style fill solid border -1
-set boxwidth 0.9
 set key off
 set title "${TITLE:-Histogram}"
 set xlabel "${XLABEL:-Value}"
 set ylabel "${YLABEL:-Count}"
-plot '${DATA_FILE}' using 2:xtic(1) with boxes lc rgb '#4A90D9'
+plot '${DATA_FILE}' using 1:2 every ::1 with boxes lc rgb '#4A90D9'
 GNUPLOT
 }
 
 write_scatter_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set title "${TITLE:-Scatter Plot}"
 set xlabel "${XLABEL:-X}"
 set ylabel "${YLABEL:-Y}"
 set key off
-plot '${DATA_FILE}' using 1:2 with points pt 7 ps 0.5 lc rgb '#D94A4A'
+plot '${DATA_FILE}' using 1:2 every ::1 with points pt 7 ps 0.5 lc rgb '#D94A4A'
 GNUPLOT
 }
 
 write_line_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set title "${TITLE:-Line Chart}"
 set xlabel "${XLABEL:-Time}"
 set ylabel "${YLABEL:-Value}"
@@ -152,12 +153,13 @@ set xdata time
 set timefmt "%Y-%m-%d %H:%M:%S"
 set format x "%Y-%m-%d"
 set grid
-plot '${DATA_FILE}' using 1:2 with lines lw 2 lc rgb '#4A90D9'
+plot '${DATA_FILE}' using 1:2 every ::1 with lines lw 2 lc rgb '#4A90D9'
 GNUPLOT
 }
 
 write_bar_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set style data histogram
 set style histogram cluster gap 1
 set style fill solid border -1
@@ -167,12 +169,13 @@ set xlabel "${XLABEL:-Category}"
 set ylabel "${YLABEL:-Value}"
 set key off
 set xtics rotate by -45
-plot '${DATA_FILE}' using 2:xtic(1) with boxes lc rgb '#50B86C'
+plot '${DATA_FILE}' using 2:xtic(1) every ::1 with boxes lc rgb '#50B86C'
 GNUPLOT
 }
 
 write_boxplot_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set title "${TITLE:-Boxplot}"
 set xlabel "${XLABEL:-Category}"
 set ylabel "${YLABEL:-Value}"
@@ -180,12 +183,13 @@ set key off
 set style data boxplot
 set style boxplot outliers pointtype 7
 set xtics rotate by -45
-plot '${DATA_FILE}' using (1.0):1 with boxplot lc rgb '#4A90D9'
+plot '${DATA_FILE}' using 1 every ::1 with boxplot lc rgb '#4A90D9'
 GNUPLOT
 }
 
 write_heatmap_script() {
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set title "${TITLE:-Heatmap}"
 set xlabel "${XLABEL:-X}"
 set ylabel "${YLABEL:-Y}"
@@ -193,7 +197,7 @@ set view map
 set dgrid3d 50,50 gauss
 set pm3d interpolate 20,20
 set palette defined (0 '#313695', 1 '#4575B4', 2 '#74ADD1', 3 '#ABD9E9', 4 '#E0F3F8', 5 '#FFFFBF', 6 '#FEE090', 7 '#FDAE61', 8 '#F46D43', 9 '#D73027', 10 '#A50026')
-splot '${DATA_FILE}' using 1:2:3 with pm3d notitle
+splot '${DATA_FILE}' using 1:2:3 every ::1 with pm3d notitle
 GNUPLOT
 }
 
@@ -222,6 +226,7 @@ write_facet_script() {
     rows=$(( (group_count + cols - 1) / cols ))
 
     cat > "$GNUPLOT_SCRIPT" <<GNUPLOT
+set datafile separator comma
 set multiplot layout ${rows},${cols} title "${TITLE:-Faceted Chart}"
 set style data histogram
 set style histogram cluster gap 1
@@ -242,7 +247,7 @@ GNUPLOT
 set title "${group}"
 set xlabel "${XLABEL:-Category}"
 set ylabel "${YLABEL:-Value}"
-plot '${group_file}' using 2:xtic(1) with boxes lc rgb '#4A90D9'
+plot '${group_file}' using 2:xtic(1) every ::1 with boxes lc rgb '#4A90D9'
 GNUPLOT
         else
             cat >> "$GNUPLOT_SCRIPT" <<GNUPLOT
