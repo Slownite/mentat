@@ -1,0 +1,38 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y duckdb gnuplot bats bc
+          mkdir -p /tmp/qsv
+          QSV_VERSION=$(curl -s https://api.github.com/repos/jqnatividad/qsv/releases/latest | grep tag_name | cut -d'"' -f4)
+          curl -sL "https://github.com/jqnatividad/qsv/releases/download/${QSV_VERSION}/qsv-${QSV_VERSION}-x86_64-unknown-linux-gnu.zip" -o /tmp/qsv/qsv.zip
+          unzip -o /tmp/qsv/qsv.zip -d /tmp/qsv
+          chmod +x /tmp/qsv/qsv
+          sudo mv /tmp/qsv/qsv /usr/local/bin/qsv
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install duckdb qsv gnuplot bats-core
+
+      - name: Run selfcheck
+        run: ./scripts/mentat_selfcheck
+
+      - name: Run tests
+        run: bats tests/ --verbose-run

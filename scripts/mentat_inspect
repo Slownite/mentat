@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: mentat_inspect <path> [--stats <table>]
+
+Discover the schema of a data source. Returns compressed DDL format.
+
+Arguments:
+  <path>        File path (.csv, .parquet, .json, .sqlite, .db) or directory
+
+Options:
+  --stats <table>  Run Phase 2 profiling for a specific table (row counts, null ratios, etc.)
+  --help           Show this help
+
+Output format (Phase 1):
+  -- mydb.sqlite (N tables, M FK chains)
+  table_name(col1 TYPE PK, col2 TYPE, col3 FK->ref.col)
+  ...
+
+Output format (Phase 2, with --stats):
+  ~table_name: rows=N nulls:col1=X% distinct:col1=N col1:[min,max]
+EOF
+}
+
+if [ $# -eq 0 ] || [ "$1" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+DB_PATH=""
+DO_STATS=false
+STATS_TABLE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --stats)
+            DO_STATS=true
+            STATS_TABLE="$2"
+            shift 2
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        *)
+            DB_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$DB_PATH" ]; then
+    echo "ERROR: No data source path provided."
+    usage
+    exit 1
+fi
+
+# Phase 2 profiling (lazy, on-demand)
+if $DO_STATS; then
+    if [ ! -f "$DB_PATH" ]; then
+        echo "ERROR: File not found: $DB_PATH"
+        exit 1
+    fi
+
+    ext="${DB_PATH##*.}"
+    case "$ext" in
+        sqlite|db)
+            # Get row count and column stats for the specified table
+            result=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) AS cnt FROM _db.\"${STATS_TABLE}\";" 2>&1) || {
+                echo "ERROR: Could not query table '${STATS_TABLE}': $result"
+                exit 1
+            }
+            row_count=$(echo "$result" | tail -1)
+
+            # Get column stats (null counts, distinct counts, min/max)
+            cols=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); DESCRIBE _db.\"${STATS_TABLE}\";" 2>/dev/null | tail -n +2 | cut -d',' -f1)
+            null_parts=""
+            distinct_parts=""
+            range_parts=""
+            for col in $cols; do
+                null_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT SUM(CASE WHEN \"${col}\" IS NULL THEN 1 ELSE 0 END) FROM _db.\"${STATS_TABLE}\";" 2>/dev/null || echo "0")
+                if [ "$row_count" != "0" ] && [ "$null_cnt" != "" ]; then
+                    null_pct=$(echo "scale=1; $null_cnt * 100 / $row_count" | bc 2>/dev/null || echo "?")
+                    [ "$null_pct" != "0" ] && [ "$null_pct" != "0.0" ] && null_parts="${null_parts}${col}=${null_pct}% "
+                fi
+                distinct_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT COUNT(DISTINCT \"${col}\") FROM _db.\"${STATS_TABLE}\";" 2>/dev/null || echo "?")
+                [ "$distinct_cnt" != "?" ] && [ "$distinct_cnt" != "$row_count" ] && distinct_parts="${distinct_parts}${col}=${distinct_cnt} "
+
+                # Min/max for numeric columns
+                minmax=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT MIN(CAST(\"${col}\" AS DOUBLE)), MAX(CAST(\"${col}\" AS DOUBLE)) FROM _db.\"${STATS_TABLE}\";" 2>/dev/null || echo "," )
+                min_val=$(echo "$minmax" | cut -d',' -f1)
+                max_val=$(echo "$minmax" | cut -d',' -f2)
+                if [ "$min_val" != "" ] && [ "$min_val" != "NULL" ]; then
+                    range_parts="${range_parts}${col}:[${min_val},${max_val}] "
+                fi
+            done
+            echo "~${STATS_TABLE}: rows=${row_count} nulls:${null_parts}distinct:${distinct_parts}${range_parts}"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: --stats only supported for SQLite databases. Flat file profiling coming soon."
+            exit 1
+            ;;
+    esac
+fi
+
+# Phase 1: Schema discovery
+
+# Handle directory
+if [ -d "$DB_PATH" ]; then
+    file_count=0
+    file_list=""
+    for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
+        [ -f "$f" ] || continue
+        file_count=$((file_count + 1))
+        file_list="${file_list}${f}\n"
+    done
+
+    if [ $file_count -eq 0 ]; then
+        echo "ERROR: No supported files found in ${DB_PATH} (csv, parquet, json, sqlite, db)"
+        exit 1
+    fi
+
+    if [ $file_count -gt 100 ]; then
+        echo "Found ${file_count} files. Showing first 100. Use a specific subdirectory or file list for the rest."
+    fi
+
+    echo "-- ${DB_PATH} (${file_count} files)"
+    count=0
+    for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
+        [ -f "$f" ] || continue
+        count=$((count + 1))
+        [ $count -gt 100 ] && break
+        "$0" "$f" 2>/dev/null | tail -n +2
+    done
+    exit 0
+fi
+
+# Handle single file
+if [ ! -f "$DB_PATH" ]; then
+    echo "ERROR: File not found: $DB_PATH"
+    exit 1
+fi
+
+ext="${DB_PATH##*.}"
+filename=$(basename "$DB_PATH")
+tablename="${filename%.*}"
+# Sanitize table name (replace non-alphanumeric with underscore, ensure starts with letter or underscore)
+tablename=$(echo "$tablename" | sed 's/[^a-zA-Z0-9_]/_/g' | sed 's/^\([0-9]\)/_\1/')
+
+case "$ext" in
+    sqlite|db)
+        # Get list of tables and views
+        tables=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT name, type FROM _db.sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name;" 2>&1) || {
+            echo "ERROR: Could not read database: $tables"
+            exit 1
+        }
+
+        if [ -z "$tables" ] || [ "$tables" = "name,type" ]; then
+            echo "ERROR: Database contains no tables or views."
+            exit 1
+        fi
+
+        table_count=$(echo "$tables" | tail -n +2 | wc -l)
+        fk_count=0
+        tables_output=""
+
+        # Process each table
+        echo "$tables" | tail -n +2 | while IFS=',' read -r tname ttype; do
+            tname=$(echo "$tname" | xargs)
+            ttype=$(echo "$ttype" | xargs)
+
+            # Get column info via DESCRIBE
+            desc_output=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); DESCRIBE _db.\"${tname}\";" 2>/dev/null) || {
+                continue
+            }
+
+            # Get CREATE TABLE SQL for FK detection
+            create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT sql FROM _db.sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
+
+            # Build column list
+            col_parts=""
+            echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+                cname=$(echo "$cname" | xargs)
+                ctype=$(echo "$ctype" | xargs)
+                ckey=$(echo "$ckey" | xargs)
+
+                # Detect PK
+                if [ "$ckey" = "PRI" ]; then
+                    ctype="${ctype} PK"
+                fi
+
+                # Detect inline FK via REFERENCES in CREATE TABLE SQL
+                if [ -n "$create_sql" ]; then
+                    col_def=$(echo "$create_sql" | grep -oE "\"${cname}\"[^,)]*" | head -1 || echo "")
+                    if echo "$col_def" | grep -qi "REFERENCES"; then
+                        ref_part=$(echo "$col_def" | sed 's/.*REFERENCES[[:space:]]*//i' | tr '(' ' ' | tr -d '")' | xargs)
+                        ref_table=$(echo "$ref_part" | awk '{print $1}' 2>/dev/null || echo "")
+                        ref_col=$(echo "$ref_part" | awk '{print $2}' 2>/dev/null || echo "")
+                        if [ -n "$ref_table" ] && [ -n "$ref_col" ]; then
+                            ctype="${ctype} FK->${ref_table}.${ref_col}"
+                        fi
+                    fi
+                fi
+
+                col_parts="${col_parts}${cname} ${ctype}, "
+            done
+
+            # Detect explicit FK constraints
+            has_explicit_fk=false
+            if [ -n "$create_sql" ]; then
+                if echo "$create_sql" | grep -qi "FOREIGN KEY"; then
+                    has_explicit_fk=true
+                fi
+            fi
+
+            # Build the table DDL line
+            col_line=$(echo "$col_parts" | sed 's/, $//')
+            echo "${tname}(${col_line})"
+
+            # Note explicit FKs
+            if $has_explicit_fk; then
+                echo "  -- has explicit FOREIGN KEY constraints"
+            fi
+        done
+
+        # Count FKs for header
+        fk_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM _db.sqlite_master WHERE type='table' AND sql LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
+        # Also count inline REFERENCES
+        inline_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM _db.sqlite_master WHERE type='table' AND sql LIKE '%REFERENCES%' AND sql NOT LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
+        total_fk=$((fk_total + inline_total))
+
+        # Print header (done via temp file to avoid subshell issues)
+        tmpfile=$(mktemp)
+        {
+            echo "-- ${filename} (${table_count} tables, ${total_fk} FK chains)"
+            echo "$tables" | tail -n +2 | while IFS=',' read -r tname ttype; do
+                tname=$(echo "$tname" | xargs)
+                ttype=$(echo "$ttype" | xargs)
+                desc_output=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); DESCRIBE _db.\"${tname}\";" 2>/dev/null) || continue
+                create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _db (TYPE SQLITE, READ_ONLY); SELECT sql FROM _db.sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
+                col_parts=""
+                echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+                    cname=$(echo "$cname" | xargs)
+                    ctype=$(echo "$ctype" | xargs)
+                    ckey=$(echo "$ckey" | xargs)
+                    [ "$ckey" = "PRI" ] && ctype="${ctype} PK"
+                    if [ -n "$create_sql" ]; then
+                        col_def=$(echo "$create_sql" | grep -oE "\"${cname}\"[^,)]*" | head -1 || echo "")
+                        if echo "$col_def" | grep -qi "REFERENCES"; then
+                            ref_part=$(echo "$col_def" | sed 's/.*REFERENCES[[:space:]]*//i' | tr '(' ' ' | tr -d '")' | xargs)
+                            ref_table=$(echo "$ref_part" | awk '{print $1}' 2>/dev/null || echo "")
+                            ref_col=$(echo "$ref_part" | awk '{print $2}' 2>/dev/null || echo "")
+                            if [ -n "$ref_table" ] && [ -n "$ref_col" ]; then
+                                ctype="${ctype} FK->${ref_table}.${ref_col}"
+                            fi
+                        fi
+                    fi
+                    col_parts="${col_parts}${cname} ${ctype}, "
+                done
+                col_line=$(echo "$col_parts" | sed 's/, $//')
+                echo "${tname}(${col_line})"
+            done
+        } > "$tmpfile"
+        cat "$tmpfile"
+        rm "$tmpfile"
+        ;;
+    csv)
+        # For CSV: use qsv for quick stats, DuckDB for schema
+        desc_output=$(duckdb -csv -c "DESCRIBE SELECT * FROM read_csv_auto('${DB_PATH}');" 2>/dev/null) || {
+            echo "ERROR: Could not read CSV file: ${DB_PATH}"
+            exit 1
+        }
+        col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
+        col_parts=""
+        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+            cname=$(echo "$cname" | xargs)
+            ctype=$(echo "$ctype" | xargs)
+            col_parts="${col_parts}${cname} ${ctype}, "
+        done
+        col_line=$(echo "$col_parts" | sed 's/, $//')
+        echo "-- ${filename} (${col_count} columns)"
+        echo "${tablename}(${col_line})"
+        ;;
+    parquet)
+        desc_output=$(duckdb -csv -c "DESCRIBE SELECT * FROM '${DB_PATH}';" 2>/dev/null) || {
+            echo "ERROR: Could not read Parquet file: ${DB_PATH}"
+            exit 1
+        }
+        col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
+        col_parts=""
+        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+            cname=$(echo "$cname" | xargs)
+            ctype=$(echo "$ctype" | xargs)
+            col_parts="${col_parts}${cname} ${ctype}, "
+        done
+        col_line=$(echo "$col_parts" | sed 's/, $//')
+        echo "-- ${filename} (${col_count} columns)"
+        echo "${tablename}(${col_line})"
+        ;;
+    json)
+        desc_output=$(duckdb -csv -c "DESCRIBE SELECT * FROM read_json_auto('${DB_PATH}');" 2>/dev/null) || {
+            echo "ERROR: Could not read JSON file: ${DB_PATH}"
+            exit 1
+        }
+        col_count=$(echo "$desc_output" | tail -n +2 | wc -l)
+        col_parts=""
+        echo "$desc_output" | tail -n +2 | while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+            cname=$(echo "$cname" | xargs)
+            ctype=$(echo "$ctype" | xargs)
+            col_parts="${col_parts}${cname} ${ctype}, "
+        done
+        col_line=$(echo "$col_parts" | sed 's/, $//')
+        echo "-- ${filename} (${col_count} columns)"
+
+        # For JSON, also show one sample record for nested structure context
+        sample=$(duckdb -json -c "SELECT * FROM read_json_auto('${DB_PATH}') LIMIT 1;" 2>/dev/null | head -20) || sample=""
+
+        echo "${tablename}(${col_line})"
+        if [ -n "$sample" ] && [ "$sample" != "[]" ]; then
+            echo "  sample: ${sample}"
+        fi
+        ;;
+    *)
+        echo "ERROR: Unsupported file format: .${ext}"
+        echo "Supported formats: csv, parquet, json, sqlite, db"
+        exit 1
+        ;;
+esac
