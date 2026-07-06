@@ -16,8 +16,9 @@
           default = self.packages.${system}.mentat;
           mentat = pkgs.stdenv.mkDerivation {
             pname = "mentat";
-            version = "0.1.0";
+            version = "0.2.0";
             src = self;
+            buildInputs = [ pkgs.jq ];
             installPhase = ''
               mkdir -p $out/share/mentat
               cp SKILL.md $out/share/mentat/
@@ -31,6 +32,7 @@
             meta = with pkgs.lib; {
               description = "Token-efficient EDA agent for OpenCode";
               license = licenses.mit;
+              runtimeDependencies = [ pkgs.jq pkgs.duckdb pkgs.gnuplot ];
             };
           };
         };

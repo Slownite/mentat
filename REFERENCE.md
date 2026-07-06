@@ -1,6 +1,6 @@
 # Mentat Reference
 
-Edge cases, join rules, business terms, and configuration details extracted from SKILL.md.
+Edge cases, join rules, business terms, and configuration details. All output is JSON.
 
 ## Assumptions Block
 
@@ -17,6 +17,18 @@ Assumptions:
 
 **ALL assumptions must be declared.** No silent inferences, no hidden defaults.
 
+## JSON Error Responses
+
+Every error response follows this schema:
+```json
+{"status":"error","error":{"message":"descriptive message","code":1}}
+```
+
+Common error codes:
+- 1: General error (missing args, invalid input, unsupported format)
+- 2+: DuckDB errors (SQL syntax, type mismatches)
+- 3+: Gnuplot errors (rendering failures)
+
 ## Business Terms
 
 When the user uses ambiguous business terms (churn, active, engaged, high-value):
@@ -32,13 +44,7 @@ When tables have no declared foreign keys:
 2. **Tier 2:** Infer from `{table}_id` / `id` naming convention (announce as assumption)
 3. **Tier 3:** Ask user if naming convention fails
 4. **Never** use value-domain matching (comparing actual data values)
-5. **Cap join depth at 3** (e.g., users→orders→payments is depth 2)
-
-## Output Structure
-
-Chart output: ASCII to stdout by default. `--output PATH` saves PNG to the given path (no default output directory).
-
-A `latest` symlink can be managed by the user. User handles cleanup.
+5. **Cap join depth at 3** (e.g., users->orders->payments is depth 2)
 
 ## Markdown Report
 
@@ -51,21 +57,22 @@ Optional report when user requests "save this":
 
 ## Degenerate Data
 
-| Scenario | Response |
-|----------|----------|
-| 1 row | "Insufficient data for distribution. Need ≥10 rows." |
-| All categorical | "Requires numeric data. Consider frequency analysis?" |
-| Identical timestamps | "All records share same timestamp. Time-series not possible." |
+| Scenario | JSON signal | Response |
+|---|---|---|
+| 1 row | `data.warning: "Only 1 row"` | "Insufficient data for distribution. Need >=10 rows." |
+| All categorical | `data.categorical: true` | "Requires numeric data. Consider frequency analysis?" |
+| Identical timestamps | Empty `data.points` | "All records share same timestamp. Time-series not possible." |
+| Empty result | `data.rows: 0` | "No matching data found." |
 
 ## Large Result Sets
 
 | Size | Action |
-|------|--------|
+|---|---|
 | <100K rows | Use full data |
 | 100K-1M | Sample to 50K (scatter) or auto-bin (distributions) |
 | >1M | Always aggregate/bin. Never return raw data. |
 
-Announce strategy. Do not ask permission.
+When truncated, JSON includes `data.warning` or `data.capped: true`.
 
 ## Session State
 
@@ -79,20 +86,17 @@ Settings read in priority order: env vars > `./mentat.config` > `~/.config/menta
 
 | Variable | Default | Description |
 |---|---|---|
-| `MENTAT_TOKEN_BUDGET` | `6000` | Soft token target per query |
-| `MENTAT_MAX_RETRIES` | `2` | Self-correction retry limit |
+| `MENTAT_OUTPUT_DIR` | `.` | Directory for `-o` plots |
+| `MENTAT_MAX_ROWS` | `100000` | Hard row cap per query |
 | `MENTAT_OUTLIER_METHOD` | `iqr` | Outlier detection method (`iqr` / `zscore`) |
-| `MENTAT_TIMESERIES_BUCKET` | `auto` | Default time-series granularity |
-| `MENTAT_LOG_LEVEL` | `info` | Logging level |
-
-## Token Budget
-
-Soft target: 6K tokens/query. Schema ~2K, SQL+results ~2K, interpretation ~2K.
-
-For large schemas (>20 tables), use keyword matching on user's question to filter relevance.
+| `MENTAT_MAX_RETRIES` | `2` | Self-correction retry limit |
 
 ## Directory / Multi-File Input
 
 - Each file = separate queryable table
-- Directories: scan for supported extensions, present summary ("Found 50 CSVs, 3 Parquet, 1 SQLite"), ask which to inspect
+- Directories: scan for supported extensions, returns `data.names` list
 - Cap at 100 files. If exceeded, ask user to narrow scope.
+
+## Version
+
+`mentat --version` returns `{"status":"ok","data":{"version":"0.2.0"}}`.

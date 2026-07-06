@@ -1,29 +1,102 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-    cat <<EOF
-Usage: mentat <subcommand> [args]
+MENTAT_VERSION="0.2.0"
 
-Subcommands:
-  selfcheck           Validate dependencies (duckdb, qsv, gnuplot)
-  inspect <path>      Discover schema (--stats <table> for profiling)
-  query <path> <sql>  Execute SQL, return stats-enriched results
-  histogram <path> <col>    Distribution of 1 numeric column
-  scatter <path> <x> <y>    Correlation of 2 numeric columns
-  bar <path> <cat> [<val>]  Categorical frequencies
-  line <path> <time> <val>  Time-series trend
-  boxplot <path> <cat> <val> Categorical vs numeric comparison
-  heatmap <path> <x> <y> <z> 2D density / cross-tab
+# Default config values
+: "${MENTAT_OUTPUT_DIR:=.}"
+: "${MENTAT_MAX_ROWS:=100000}"
+: "${MENTAT_OUTLIER_METHOD:=iqr}"
+: "${MENTAT_MAX_RETRIES:=2}"
 
-Global flags:
-  --help             Show this help
+MENTAT_IS_SQLITE=false
+MENTAT_DATASOURCE=""
+MENTAT_TABLE=""
+MENTAT_TABLE_REF=""
 
-Each subcommand supports --help for detailed usage.
-EOF
+# === Config Loading ===
+load_config() {
+    local files=(
+        "$HOME/.config/mentat/config"
+        "./mentat.config"
+    )
+    for f in "${files[@]}"; do
+        if [ -f "$f" ]; then
+            source "$f"
+        fi
+    done
+}
+load_config
+
+# === JSON Helpers ===
+
+json_error() {
+    local msg="$1"
+    local code="${2:-1}"
+    jq -nc --arg msg "$msg" --argjson code "$code" \
+        '{"status":"error","error":{"message":$msg,"code":$code}}'
+    exit "$code"
 }
 
-# === Shared helpers ===
+json_ok() {
+    local json="$1"
+    printf '{"status":"ok","data":%s}\n' "$json"
+}
+
+json_ok_pipe() {
+    jq -c '{status: "ok", data: .}'
+}
+
+# === Input Validation ===
+
+validate_file() {
+    local path="$1"
+    local ctx="${2:-datasource}"
+    [ -f "$path" ] && [ -r "$path" ] && return 0
+    [ ! -e "$path" ] && json_error "${ctx} not found: ${path}"
+    [ ! -r "$path" ] && json_error "${ctx} not readable: ${path}"
+}
+
+validate_column() {
+    local name="$1"
+    local ctx="${2:-column}"
+    case "$name" in
+        *\"*|*\'*|*\`*|*\\*)
+            json_error "${ctx} contains invalid characters: ${name}" ;;
+    esac
+}
+
+validate_numeric() {
+    local val="$1"
+    local name="${2:-value}"
+    case "$val" in
+        ''|*[!0-9]*)
+            json_error "${name} must be a number, got: ${val}" ;;
+    esac
+}
+
+validate_bucket() {
+    local val="$1"
+    case "$val" in
+        auto|hourly|daily|weekly|monthly|yearly) return 0 ;;
+        *) json_error "invalid bucket: ${val} (must be auto|hourly|daily|weekly|monthly|yearly)" ;;
+    esac
+}
+
+validate_outlier_method() {
+    local val="$1"
+    case "$val" in
+        iqr|zscore) return 0 ;;
+        *) json_error "invalid outlier method: ${val} (must be iqr|zscore)" ;;
+    esac
+}
+
+normalize_ext() {
+    local ext="$1"
+    echo "$ext" | tr '[:upper:]' '[:lower:]'
+}
+
+# === Shared Helpers ===
 
 dn_open() {
     local path="$1"
@@ -32,26 +105,19 @@ dn_open() {
     MENTAT_TABLE="$table"
     MENTAT_IS_SQLITE=false
 
-    if [ ! -f "$path" ]; then
-        echo "ERROR: File not found: $path" >&2
-        exit 1
-    fi
+    validate_file "$path"
 
-    local ext="${path##*.}"
+    local ext
+    ext=$(normalize_ext "${path##*.}")
     case "$ext" in
-        csv)
-            MENTAT_TABLE_REF="read_csv_auto('$path')" ;;
-        parquet)
-            MENTAT_TABLE_REF="'$path'" ;;
-        json)
-            MENTAT_TABLE_REF="read_json_auto('$path')" ;;
+        csv)    MENTAT_TABLE_REF="read_csv_auto('${path}')" ;;
+        parquet) MENTAT_TABLE_REF="'${path}'" ;;
+        json)   MENTAT_TABLE_REF="read_json_auto('${path}')" ;;
         sqlite|db)
             MENTAT_IS_SQLITE=true
-            [ -z "$MENTAT_TABLE" ] && echo "ERROR: --table required for SQLite" >&2 && exit 1
-            MENTAT_TABLE_REF="_d.\"$MENTAT_TABLE\"" ;;
-        *)
-            echo "ERROR: unsupported format: .$ext" >&2
-            exit 1 ;;
+            [ -z "$MENTAT_TABLE" ] && json_error "--table required for SQLite"
+            MENTAT_TABLE_REF="_d.\"${MENTAT_TABLE}\"" ;;
+        *)      json_error "unsupported format: .${ext}" ;;
     esac
 }
 
@@ -63,7 +129,30 @@ run_duckdb() {
     else
         full_sql="$sql"
     fi
-    duckdb -csv -c "$full_sql" 2>&1
+    local result
+    result=$(duckdb -csv -c "$full_sql" 2>/dev/null) || {
+        local err
+        err=$(duckdb -csv -c "$full_sql" 2>&1 1>/dev/null)
+        json_error "duckdb: ${err}"
+    }
+    echo "$result"
+}
+
+run_duckdb_json() {
+    local sql="$1"
+    local full_sql
+    if [ "$MENTAT_IS_SQLITE" = "true" ]; then
+        full_sql="ATTACH '${MENTAT_DATASOURCE}' AS _d (TYPE SQLITE, READ_ONLY); ${sql}"
+    else
+        full_sql="$sql"
+    fi
+    local result
+    result=$(duckdb -json -c "$full_sql" 2>/dev/null) || {
+        local err
+        err=$(duckdb -json -c "$full_sql" 2>&1 1>/dev/null)
+        json_error "duckdb: ${err}"
+    }
+    echo "$result"
 }
 
 gnu_render() {
@@ -72,46 +161,48 @@ gnu_render() {
     local plot_cmd="$3"
     local output="${4:-}"
 
-    local ascii_cmd="set terminal dumb 80 25; set datafile separator comma; $preamble; $plot_cmd"
-    echo "$data" | gnuplot -e "$ascii_cmd" 2>/dev/null || true
+    [ -z "$output" ] && return 0
 
-    if [ -n "$output" ]; then
-        local png_cmd="set terminal pngcairo enhanced font 'sans,10' size 800,600; set output '$output'; set datafile separator comma; $preamble; $plot_cmd"
-        local gperr
-        gperr=$(echo "$data" | gnuplot -e "$png_cmd" 2>&1) || {
-            echo "ERROR: gnuplot failed: $gperr" >&2
-            exit 1
-        }
-        echo "saved: $output"
+    local mkdir_dir
+    mkdir_dir=$(dirname "$output")
+    [ "$mkdir_dir" != "." ] && mkdir -p "$mkdir_dir"
+
+    local png_cmd
+    png_cmd="set terminal pngcairo enhanced font 'sans,10' size 800,600; set output '${output}'; set datafile separator comma; ${preamble}; ${plot_cmd}"
+    local gperr
+    gperr=$(echo "$data" | gnuplot -e "$png_cmd" 2>&1) || {
+        json_error "gnuplot failed: ${gperr}"
+    }
+    if [ ! -s "$output" ]; then
+        json_error "gnuplot produced empty PNG"
     fi
 }
 
-# === Subcommand functions ===
+csv_to_json() {
+    cat - | duckdb -json -c "SELECT * FROM read_csv_auto('/dev/stdin')" 2>/dev/null || echo "[]"
+}
+
+# === Subcommand Functions ===
 
 cmd_selfcheck() {
-    local errors=0
-    echo "=== Mentat dependency check ==="
-    echo ""
-    for c in duckdb qsv gnuplot; do
-        if ! command -v "$c" &>/dev/null; then
-            echo "MISSING: $c"
-            errors=1
-        else
+    local deps=""
+    for c in duckdb qsv gnuplot jq; do
+        if command -v "$c" &>/dev/null; then
             local ver
             ver=$("$c" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "found")
-            echo "FOUND: $c ($ver, path: $(command -v "$c"))"
+            deps="${deps}${deps:+,}{\"name\":\"${c}\",\"found\":true,\"version\":\"${ver}\"}"
+        else
+            deps="${deps}${deps:+,}{\"name\":\"${c}\",\"found\":false,\"version\":null}"
         fi
     done
-    echo ""
-    [ $errors -eq 0 ] && echo "All dependencies found." && exit 0
-    echo "ERROR: Missing dependencies. See README for install instructions." >&2
-    exit 1
+    local json
+    json=$(jq -nc --arg deps "[$deps]" --arg ver "$MENTAT_VERSION" \
+        '{version: $ver, dependencies: $deps | fromjson}')
+    json_ok "$json"
 }
 
 cmd_inspect() {
-    local DB_PATH=""
-    local DO_STATS=false
-    local STATS_TABLE=""
+    local DB_PATH="" DO_STATS=false STATS_TABLE=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -119,80 +210,123 @@ cmd_inspect() {
             --help) cat <<EOF
 Usage: mentat inspect <path> [--stats <table>]
 
-Discover schema of a data source.
-Output: -- filename (N tables, M FK chains)
-        table(col TYPE PK, col2 TYPE FK->ref.col)
-
-  --stats <table>  Row counts, null ratios, distinct counts, ranges
-  --help           This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) DB_PATH="$1"; shift ;;
         esac
     done
 
-    [ -z "$DB_PATH" ] && echo "ERROR: path required" >&2 && exit 1
+    [ -z "$DB_PATH" ] && json_error "path required"
 
     if [ ! -f "$DB_PATH" ] && [ ! -d "$DB_PATH" ]; then
-        echo "ERROR: not found: $DB_PATH" >&2; exit 1
+        json_error "not found: ${DB_PATH}"
     fi
 
-    # Phase 2 — stats on a specific table
-    if $DO_STATS; then
-        [ ! -f "$DB_PATH" ] && echo "ERROR: --stats requires a file, not a directory" >&2 && exit 1
-        local ext="${DB_PATH##*.}"
-        [ "$ext" != "sqlite" ] && [ "$ext" != "db" ] && echo "ERROR: --stats only for SQLite" >&2 && exit 1
-
-        local row_count
-        row_count=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM _d.\"${STATS_TABLE}\";" 2>&1) || {
-            echo "ERROR: cannot query table: $row_count" >&2; exit 1
-        }
-        local cols
-        cols=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT name FROM pragma_table_info('${STATS_TABLE}');" 2>/dev/null) || {
-            echo "ERROR: table not found: ${STATS_TABLE}" >&2; exit 1
-        }
-        local null_parts="" distinct_parts="" range_parts=""
-        for col in $cols; do
-            local null_cnt
-            null_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT SUM(CASE WHEN \"${col}\" IS NULL THEN 1 ELSE 0 END) FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo "0")
-            if [ "$row_count" != "0" ] && [ -n "$null_cnt" ] && [ "$null_cnt" != "0" ]; then
-                local pct
-                pct=$(echo "scale=1; $null_cnt * 100 / $row_count" | bc 2>/dev/null || echo "?")
-                null_parts="${null_parts}${col}=${pct}% "
-            fi
-            local distinct_cnt
-            distinct_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(DISTINCT \"${col}\") FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo "?")
-            [ "$distinct_cnt" != "?" ] && [ "$distinct_cnt" != "$row_count" ] && distinct_parts="${distinct_parts}${col}=${distinct_cnt} "
-            local minmax
-            minmax=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT MIN(CAST(\"${col}\" AS DOUBLE)), MAX(CAST(\"${col}\" AS DOUBLE)) FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo ",")
-            local min_val="${minmax%%,*}"
-            local max_val="${minmax#*,}"
-            [ -n "$min_val" ] && [ "$min_val" != "NULL" ] && range_parts="${range_parts}${col}:[${min_val},${max_val}] "
-        done
-        echo "~${STATS_TABLE}: rows=${row_count} nulls:${null_parts}distinct:${distinct_parts}${range_parts}"
-        exit 0
-    fi
-
-    # Phase 1 — schema discovery
+    # Handle directory input
     if [ -d "$DB_PATH" ]; then
         local count=0
         for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
             [ -f "$f" ] && count=$((count + 1))
         done
-        [ $count -eq 0 ] && echo "ERROR: no supported files in ${DB_PATH}" >&2 && exit 1
-        [ $count -gt 100 ] && echo "Found ${count} files. Showing first 100." >&2
-        echo "-- ${DB_PATH} (${count} files)"
-        local shown=0
+        [ $count -eq 0 ] && json_error "no supported files in ${DB_PATH}"
+        local shown=0 files_json=""
         for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
             [ -f "$f" ] || continue
             shown=$((shown + 1))
             [ $shown -gt 100 ] && break
-            cmd_inspect "$f" 2>/dev/null | tail -n +2
+            local fname
+            fname=$(basename "$f")
+            files_json="${files_json}${files_json:+,}\"${fname}\""
         done
+        local json
+        json=$(jq -nc --arg path "$DB_PATH" --argjson count "$count" \
+            --argjson files "[$files_json]" \
+            '{path: $path, files: $count, names: $files}')
+        json_ok "$json"
         exit 0
     fi
 
-    local ext="${DB_PATH##*.}"
+    # --stats mode
+    if $DO_STATS; then
+        local ext
+        ext=$(normalize_ext "${DB_PATH##*.}")
+        MENTAT_DATASOURCE="$DB_PATH"
+        MENTAT_TABLE="$STATS_TABLE"
+        MENTAT_IS_SQLITE=false
+        case "$ext" in
+            sqlite|db) MENTAT_IS_SQLITE=true; MENTAT_TABLE_REF="_d.\"${STATS_TABLE}\"" ;;
+            csv)  MENTAT_TABLE_REF="read_csv_auto('${DB_PATH}')" ;;
+            parquet) MENTAT_TABLE_REF="'${DB_PATH}'" ;;
+            json) MENTAT_TABLE_REF="read_json_auto('${DB_PATH}')" ;;
+            *) json_error "unsupported format: .${ext}" ;;
+        esac
+
+        if $MENTAT_IS_SQLITE; then
+            local cols_json
+            cols_json=$(run_duckdb_json "SELECT name, type FROM pragma_table_info('${STATS_TABLE}')") || json_error "table not found: ${STATS_TABLE}"
+            local col_list
+            col_list=$(echo "$cols_json" | jq -r '.[].name' 2>/dev/null)
+            [ -z "$col_list" ] && json_error "no columns found in ${STATS_TABLE}"
+            local row_count
+            row_count=$(run_duckdb "SELECT COUNT(*) FROM _d.\"${STATS_TABLE}\"" | tail -1)
+
+            local columns_json=""
+            for col in $col_list; do
+                local null_cnt distinct_cnt minmax
+                null_cnt=$(run_duckdb "SELECT SUM(CASE WHEN \"${col}\" IS NULL THEN 1 ELSE 0 END) FROM _d.\"${STATS_TABLE}\"" | tail -1)
+                local null_pct=0
+                [ -n "$null_cnt" ] && [ "$null_cnt" != "0" ] && [ "$row_count" != "0" ] && \
+                    null_pct=$(echo "scale=1; ${null_cnt} * 100 / ${row_count}" | bc 2>/dev/null || echo "?")
+                distinct_cnt=$(run_duckdb "SELECT COUNT(DISTINCT \"${col}\") FROM _d.\"${STATS_TABLE}\"" | tail -1)
+                minmax=$(run_duckdb "SELECT MIN(CAST(\"${col}\" AS DOUBLE)), MAX(CAST(\"${col}\" AS DOUBLE)) FROM _d.\"${STATS_TABLE}\"" | tail -1)
+                local mn="${minmax%%,*}"
+                local mx="${minmax#*,}"
+                columns_json="${columns_json}${columns_json:+,}{\"name\":\"${col}\",\"null_pct\":${null_pct},\"distinct\":${distinct_cnt:-0}"
+                [ -n "$mn" ] && [ "$mn" != "NULL" ] && columns_json="${columns_json},\"range\":[${mn},${mx}]"
+                columns_json="${columns_json}}"
+            done
+            local json
+            json=$(jq -nc --arg table "$STATS_TABLE" --argjson rows "${row_count:-0}" \
+                --argjson columns "[$columns_json]" \
+                '{table: $table, rows: $rows, columns: $columns}')
+            json_ok "$json"
+        else
+            # Flat file stats
+            local schema_json
+            schema_json=$(run_duckdb_json "DESCRIBE SELECT * FROM ${MENTAT_TABLE_REF}")
+            local col_list
+            col_list=$(echo "$schema_json" | jq -r '.[].column_name // .[].name' 2>/dev/null)
+            local row_count
+            row_count=$(run_duckdb "SELECT COUNT(*) FROM ${MENTAT_TABLE_REF}" | tail -1)
+            local columns_json=""
+            for col in $col_list; do
+                local null_cnt distinct_cnt minmax
+                null_cnt=$(run_duckdb "SELECT SUM(CASE WHEN \"${col}\" IS NULL THEN 1 ELSE 0 END) FROM ${MENTAT_TABLE_REF}" | tail -1)
+                local null_pct=0
+                [ -n "$null_cnt" ] && [ "$null_cnt" != "0" ] && [ "$row_count" != "0" ] && \
+                    null_pct=$(echo "scale=1; ${null_cnt} * 100 / ${row_count}" | bc 2>/dev/null || echo "0")
+                distinct_cnt=$(run_duckdb "SELECT COUNT(DISTINCT \"${col}\") FROM ${MENTAT_TABLE_REF}" | tail -1)
+                minmax=$(run_duckdb "SELECT MIN(CAST(\"${col}\" AS DOUBLE)), MAX(CAST(\"${col}\" AS DOUBLE)) FROM ${MENTAT_TABLE_REF}" | tail -1)
+                local mn="${minmax%%,*}"
+                local mx="${minmax#*,}"
+                columns_json="${columns_json}${columns_json:+,}{\"name\":\"${col}\",\"null_pct\":${null_pct},\"distinct\":${distinct_cnt:-0}"
+                [ -n "$mn" ] && [ "$mn" != "NULL" ] && columns_json="${columns_json},\"range\":[${mn},${mx}]"
+                columns_json="${columns_json}}"
+            done
+            local json
+            json=$(jq -nc --arg file "$(basename "$DB_PATH")" --arg format "$ext" \
+                --argjson rows "${row_count:-0}" --argjson columns "[$columns_json]" \
+                '{filename: $file, format: $format, rows: $rows, columns: $columns}')
+            json_ok "$json"
+        fi
+        exit 0
+    fi
+
+    # Schema discovery
+    local ext
+    ext=$(normalize_ext "${DB_PATH##*.}")
     local filename
     filename=$(basename "$DB_PATH")
     local tablename
@@ -200,46 +334,38 @@ EOF
 
     case "$ext" in
         sqlite|db)
-            local tables
-            tables=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name;" 2>&1) || {
-                echo "ERROR: $tables" >&2; exit 1
+            MENTAT_DATASOURCE="$DB_PATH"
+            MENTAT_IS_SQLITE=true
+            MENTAT_TABLE="dummy"
+            local tables_json
+            tables_json=$(run_duckdb_json "
+                SELECT name, type FROM sqlite_master
+                WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
+                ORDER BY type, name") || {
+                json_error "$tables_json"
             }
-            [ -z "$tables" ] || [ "$tables" = "name,type" ] && echo "ERROR: no tables" >&2 && exit 1
             local tcount
-            tcount=$(echo "$tables" | tail -n +2 | wc -l)
-            local fk_total
-            fk_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
-            local ref_total
-            ref_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%REFERENCES%' AND sql NOT LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
-            local fk_all=$((fk_total + ref_total))
-            echo "-- ${filename} (${tcount} tables, ${fk_all} FK chains)"
-            echo "$tables" | tail -n +2 | while IFS=',' read -r tname ttype; do
-                tname=$(echo "$tname" | xargs)
-                local desc
-                desc=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); DESCRIBE _d.\"${tname}\";" 2>/dev/null) || continue
-                local create_sql
-                create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT sql FROM sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
-                local parts=""
-                while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
-                    cname=$(echo "$cname" | xargs); ctype=$(echo "$ctype" | xargs); ckey=$(echo "$ckey" | xargs)
-                    [ "$ckey" = "PRI" ] && ctype="${ctype} PK"
-                    if [ -n "$create_sql" ]; then
-                        local col_def
-                        col_def=$(echo "$create_sql" | grep -oE "\"${cname}\"[^,)]*" | head -1 || echo "")
-                        if echo "$col_def" | grep -qi "REFERENCES"; then
-                            local ref_part
-                            ref_part=$(echo "$col_def" | sed 's/.*REFERENCES[[:space:]]*//i' | tr '(' ' ' | tr -d '")' | xargs)
-                            local ref_t
-                            ref_t=$(echo "$ref_part" | awk '{print $1}' 2>/dev/null || echo "")
-                            local ref_c
-                            ref_c=$(echo "$ref_part" | awk '{print $2}' 2>/dev/null || echo "")
-                            [ -n "$ref_t" ] && [ -n "$ref_c" ] && ctype="${ctype} FK->${ref_t}.${ref_c}"
-                        fi
-                    fi
-                    parts="${parts}${cname} ${ctype}, "
-                done <<< "$(echo "$desc" | tail -n +2)"
-                echo "${tname}(${parts%, })"
-            done ;;
+            tcount=$(echo "$tables_json" | jq 'length' 2>/dev/null || echo "0")
+            [ "$tcount" -eq 0 ] && json_error "no tables"
+
+            local tables_arr=""
+            local tnames
+            tnames=$(echo "$tables_json" | jq -r '.[].name' 2>/dev/null)
+            for tname in $tnames; do
+                local desc_json
+                desc_json=$(run_duckdb_json "DESCRIBE _d.\"${tname}\"") || continue
+                local cols_json
+                cols_json=$(echo "$desc_json" | jq -c '[.[] | {name: (.column_name // .name), type: (.column_type // .type), pk: (.key == "PRI")}]' 2>/dev/null || echo "[]")
+                local tbl_json
+                tbl_json=$(jq -nc --arg name "$tname" --argjson cols "$cols_json" '{name: $name, columns: $cols}')
+                tables_arr="${tables_arr}${tables_arr:+,}${tbl_json}"
+            done
+            local json
+            json=$(jq -nc --arg filename "$filename" --argjson tcount "$tcount" \
+                --argjson tables "[$tables_arr]" \
+                '{filename: $filename, format: "sqlite", tables: $tcount, details: $tables}')
+            json_ok "$json" ;;
+
         csv|parquet|json)
             local rfunc
             case "$ext" in
@@ -247,104 +373,134 @@ EOF
                 parquet) rfunc="'${DB_PATH}'" ;;
                 json) rfunc="read_json_auto('${DB_PATH}')" ;;
             esac
-            local desc
-            desc=$(duckdb -csv -c "DESCRIBE SELECT * FROM ${rfunc};" 2>/dev/null) || {
-                echo "ERROR: could not read ${ext}: ${DB_PATH}" >&2; exit 1
+            local desc_json
+            desc_json=$(run_duckdb_json "DESCRIBE SELECT * FROM ${rfunc}") || {
+                json_error "could not read ${ext}: ${DB_PATH}"
             }
             local ccount
-            ccount=$(echo "$desc" | tail -n +2 | wc -l)
-            local parts=""
-            while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
-                cname=$(echo "$cname" | xargs); ctype=$(echo "$ctype" | xargs)
-                parts="${parts}${cname} ${ctype}, "
-            done <<< "$(echo "$desc" | tail -n +2)"
-            echo "-- ${filename} (${ccount} columns)"
-            echo "${tablename}(${parts%, })"
-            if [ "$ext" = "json" ]; then
-                local sample
-                sample=$(duckdb -json -c "SELECT * FROM ${rfunc} LIMIT 1;" 2>/dev/null | head -20 || echo "")
-                [ -n "$sample" ] && [ "$sample" != "[]" ] && echo "  sample: ${sample}"
-            fi ;;
-        *) echo "ERROR: unsupported: .${ext}" >&2; exit 1 ;;
+            ccount=$(echo "$desc_json" | jq 'length' 2>/dev/null || echo "0")
+            local col_details
+            col_details=$(echo "$desc_json" | jq -c '[.[] | {name: (.column_name // .name), type: (.column_type // .type)}]' 2>/dev/null || echo "[]")
+            local json
+            json=$(jq -nc --arg filename "$filename" --arg format "$ext" \
+                --argjson columns "$col_details" --argjson ccount "$ccount" \
+                '{filename: $filename, format: $format, columns: $columns, col_count: $ccount}')
+            json_ok "$json" ;;
+        *) json_error "unsupported: .${ext}" ;;
     esac
 }
 
 cmd_query() {
-    local DB_PATH="" SQL="" MODE="default" BINS=50 GROUPBY_COL="" OUTLIER_METHOD="iqr" RAW=false HISTOGRAM=false TIMESERIES=false TIMESERIES_BUCKET="auto"
+    local DB_PATH="" SQL="" MODE="default" BINS=50 GROUPBY_COL="" OUTLIER_METHOD="$MENTAT_OUTLIER_METHOD"
+    local RAW=false HISTOGRAM=false TIMESERIES=false TIMESERIES_BUCKET="auto" TABLE=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --histogram) HISTOGRAM=true; MODE="histogram"; shift ;;
-            --bins) BINS="$2"; shift 2 ;;
+            --bins) BINS="$2"; validate_numeric "$BINS" "--bins"; shift 2 ;;
             --groupby) MODE="groupby"; GROUPBY_COL="$2"; shift 2 ;;
             --timeseries) TIMESERIES=true; MODE="timeseries"; shift ;;
-            --bucket) TIMESERIES_BUCKET="$2"; shift 2 ;;
-            --outlier-method) OUTLIER_METHOD="$2"; shift 2 ;;
+            --bucket) TIMESERIES_BUCKET="$2"; validate_bucket "$TIMESERIES_BUCKET"; shift 2 ;;
+            --outlier-method) OUTLIER_METHOD="$2"; validate_outlier_method "$OUTLIER_METHOD"; shift 2 ;;
             --raw) RAW=true; MODE="raw"; shift ;;
             --table) TABLE="$2"; shift 2 ;;
             --help) cat <<EOF
 Usage: mentat query <path> <sql> [flags]
 
-  --histogram [--bins=N]    Binned distribution of first numeric column
-  --groupby <col>           Per-group stats
-  --timeseries [--bucket=auto|hourly|daily|weekly|monthly|yearly]
-  --outlier-method=iqr|zscore  (default: iqr)
-  --raw                     Return raw rows (capped at 1000)
-  --table NAME              Required for SQLite
-  --help                    This help
+All output is JSON. See SKILL.md for schema.
+
+Flags: --histogram, --bins N, --groupby COL, --timeseries,
+       --bucket auto|hourly|daily|weekly|monthly|yearly,
+       --outlier-method iqr|zscore, --raw, --table NAME
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *)
                 [ -z "$DB_PATH" ] && DB_PATH="$1" && shift && continue
                 [ -z "$SQL" ] && SQL="$1" && shift || break ;;
         esac
     done
 
-    [ -z "$DB_PATH" ] && echo "ERROR: path required" >&2 && exit 1
-    [ -z "$SQL" ] && echo "ERROR: SQL required" >&2 && exit 1
+    [ -z "$DB_PATH" ] && json_error "path required"
+    if [ -z "$SQL" ]; then
+        SQL=$(cat)
+        [ -z "$SQL" ] && json_error "SQL required (as argument or stdin)"
+    fi
 
-    local TABLE="${TABLE:-}"
+    validate_file "$DB_PATH"
     dn_open "$DB_PATH" "$TABLE"
 
+    # Run query
+    local result
+    result=$(run_duckdb "$SQL")
+
+    local row_count header first_col
+    row_count=$(echo "$result" | tail -n +2 | wc -l)
+    header=$(echo "$result" | head -1)
+    first_col=$(echo "$header" | cut -d',' -f1)
+
+    # --raw mode
     if $RAW; then
-        local raw_out
-        raw_out=$(run_duckdb "$SQL" 2>&1) || { echo "$raw_out" >&2; exit 1; }
-        echo "$raw_out" | head -1001
+        local data_json
+        data_json=$(echo "$result" | head -1001 | csv_to_json)
         local rc
-        rc=$(echo "$raw_out" | tail -n +2 | head -1000 | wc -l)
-        echo "# raw rows: ${rc} (capped at 1000)"
+        rc=$(echo "$result" | tail -n +2 | head -1000 | wc -l)
+        local capped=false
+        [ "$rc" -gt 1000 ] && capped=true
+        local headers
+        headers=$(echo "$header" | tr ',' '\n' | jq -R . | jq -cs '.')
+        local json
+        json=$(jq -nc --argjson rows "$rc" --argjson capped "$capped" \
+            --argjson data "$data_json" --argjson columns "$headers" \
+            '{rows: $rows, capped: $capped, columns: $columns, data: $data}')
+        json_ok "$json"
         exit 0
     fi
 
-    local result
-    result=$(run_duckdb "$SQL" 2>&1) || { echo "$result" >&2; exit 1; }
+    [ "$row_count" -eq 0 ] && { json_ok '{"rows":0,"warning":"No matching data found."}'; exit 0; }
+    [ "$row_count" -eq 1 ] && {
+        local sample
+        sample=$(echo "$result" | tail -1)
+        local json
+        json=$(jq -nc --argjson rows 1 --arg sample "$sample" \
+            '{rows: $rows, warning: "Only 1 row", sample: $sample}')
+        json_ok "$json"
+        exit 0
+    }
 
-    local row_count
-    row_count=$(echo "$result" | tail -n +2 | wc -l)
-    local header
-    header=$(echo "$result" | head -1)
-
-    [ "$row_count" -eq 0 ] && echo "rows=0" && echo "No matching data found." && exit 0
-    [ "$row_count" -eq 1 ] && echo "rows=1" && echo "WARNING: Only 1 row." && echo "sample: $(echo "$result" | tail -1)" && exit 0
-
-    local first_col
-    first_col=$(echo "$header" | cut -d',' -f1)
-
+    # --histogram mode
     if $HISTOGRAM; then
         local is_num
-        is_num=$(echo "$result" | duckdb -csv -noheader -c "SELECT CASE WHEN COUNT(*) > 0 THEN 'true' ELSE 'false' END FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
+        is_num=$(echo "$result" | duckdb -csv -noheader -c "
+            SELECT CASE WHEN COUNT(*) > 0 THEN 'true' ELSE 'false' END
+            FROM read_csv_auto('/dev/stdin')
+            WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
+
         if [ "$is_num" = "true" ]; then
-            echo "$result" | duckdb -csv -c "
+            local hist_json
+            hist_json=$(echo "$result" | duckdb -json -c "
                 WITH data AS (SELECT CAST(\"${first_col}\" AS DOUBLE) AS val FROM read_csv_auto('/dev/stdin') WHERE val IS NOT NULL),
                      bounds AS (SELECT MIN(val) AS mn, MAX(val) AS mx FROM data),
                      hist AS (SELECT CASE WHEN mx=mn THEN val ELSE FLOOR((val-mn)*${BINS}/NULLIF(mx-mn,0))*((mx-mn)/${BINS})+((mx-mn)/${BINS})/2+mn END AS bc, ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct FROM data,bounds GROUP BY bc)
-                SELECT ROUND(bc,2) AS bin_center, pct FROM hist ORDER BY bc;" 2>/dev/null || echo "ERROR: histogram failed" >&2
+                SELECT ROUND(bc,2) AS center, pct FROM hist ORDER BY bc;" 2>/dev/null) || {
+                json_error "histogram failed"
+            }
+            local json
+            json=$(jq -n --argjson data "$hist_json" '{mode: "histogram", bins: $data}')
+            json_ok "$json"
         else
-            echo "$result" | duckdb -csv -c "SELECT \"${first_col}\" AS cat, COUNT(*) AS n FROM read_csv_auto('/dev/stdin') GROUP BY cat ORDER BY n DESC LIMIT 50;" 2>/dev/null
+            local freq_json
+            freq_json=$(echo "$result" | duckdb -json -c "
+                SELECT \"${first_col}\" AS category, COUNT(*) AS n
+                FROM read_csv_auto('/dev/stdin') GROUP BY category ORDER BY n DESC LIMIT 50;" 2>/dev/null)
+            local json
+            json=$(jq -n --argjson data "$freq_json" '{mode: "frequency", categories: $data}')
+            json_ok "$json"
         fi
         exit 0
     fi
 
+    # --timeseries mode
     if $TIMESERIES; then
         local second_col
         second_col=$(echo "$header" | cut -d',' -f2)
@@ -362,42 +518,59 @@ EOF
         fi
         local bucket_expr
         case "$TIMESERIES_BUCKET" in
-            hourly) bucket_expr="DATE_TRUNC('hour',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
-            daily)  bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
-            weekly) bucket_expr="DATE_TRUNC('week',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
-            monthly)bucket_expr="DATE_TRUNC('month',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
-            yearly) bucket_expr="DATE_TRUNC('year',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
-            *)      bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            hourly)  bucket_expr="DATE_TRUNC('hour',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            daily)   bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            weekly)  bucket_expr="DATE_TRUNC('week',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            monthly) bucket_expr="DATE_TRUNC('month',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            yearly)  bucket_expr="DATE_TRUNC('year',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            *)       bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
         esac
-        echo "# timeseries bucket: ${TIMESERIES_BUCKET}"
-        echo "$result" | duckdb -csv -c "
+        local ts_json
+        ts_json=$(echo "$result" | duckdb -json -c "
             WITH data AS (SELECT ${bucket_expr} AS ts_bucket, TRY_CAST(\"${second_col}\" AS DOUBLE) AS val FROM read_csv_auto('/dev/stdin') WHERE val IS NOT NULL),
                  agg AS (SELECT ts_bucket, COUNT(*) AS n, ROUND(AVG(val),2) AS mean, MEDIAN(val) AS median, MIN(val) AS mn, MAX(val) AS mx FROM data GROUP BY ts_bucket)
-            SELECT COALESCE(ts_bucket,'epoch') AS ts_bucket, COALESCE(n,0) AS n, COALESCE(mean,0) AS mean, COALESCE(median,0) AS median, COALESCE(mn,0) AS mn, COALESCE(mx,0) AS mx FROM agg ORDER BY ts_bucket;" 2>/dev/null || echo "ERROR: timeseries failed" >&2
-        echo "# gaps filled with zeros"
+            SELECT COALESCE(ts_bucket,'epoch') AS ts, COALESCE(n,0) AS n, COALESCE(mean,0) AS mean,
+                   COALESCE(median,0) AS median, COALESCE(mn,0) AS mn, COALESCE(mx,0) AS mx
+            FROM agg ORDER BY ts;" 2>/dev/null) || {
+            json_error "timeseries failed"
+        }
+        local json
+        json=$(jq -n --arg bucket "$TIMESERIES_BUCKET" --argjson points "$ts_json" \
+            '{bucket: $bucket, points: $points}')
+        json_ok "$json"
         exit 0
     fi
 
+    # --groupby mode
     if [ "$MODE" = "groupby" ] && [ -n "$GROUPBY_COL" ]; then
         local val_col
         val_col=$(echo "$header" | cut -d',' -f2)
-        echo "$result" | duckdb -csv -c "
-            SELECT \"${GROUPBY_COL}\" AS grp, COUNT(*) AS n, ROUND(AVG(TRY_CAST(\"${val_col}\" AS DOUBLE)),2) AS mean,
+        local grp_json
+        grp_json=$(echo "$result" | duckdb -json -c "
+            SELECT \"${GROUPBY_COL}\" AS group, COUNT(*) AS n, ROUND(AVG(TRY_CAST(\"${val_col}\" AS DOUBLE)),2) AS mean,
                    MEDIAN(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS med, MIN(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS mn, MAX(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS mx
-            FROM read_csv_auto('/dev/stdin') GROUP BY grp ORDER BY n DESC;" 2>/dev/null
+            FROM read_csv_auto('/dev/stdin') GROUP BY \"${GROUPBY_COL}\" ORDER BY n DESC;" 2>/dev/null)
+        local json
+        json=$(jq -n --argjson groups "$grp_json" '{groups: $groups}')
+        json_ok "$json"
         exit 0
     fi
 
     # Default mode: stats on first numeric column
     local is_num
-    is_num=$(echo "$result" | duckdb -csv -noheader -c "SELECT CASE WHEN COUNT(*)>0 THEN 'true' ELSE 'false' END FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
+    is_num=$(echo "$result" | duckdb -csv -noheader -c "
+        SELECT CASE WHEN COUNT(*)>0 THEN 'true' ELSE 'false' END
+        FROM read_csv_auto('/dev/stdin')
+        WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
 
-    local out="rows=${row_count}"
     if [ "$is_num" = "true" ]; then
         local stats
         stats=$(echo "$result" | duckdb -csv -noheader -c "
             WITH nums AS (SELECT TRY_CAST(\"${first_col}\" AS DOUBLE) AS v FROM read_csv_auto('/dev/stdin') WHERE v IS NOT NULL)
-            SELECT ROUND(MIN(v),2), ROUND(MAX(v),2), ROUND(AVG(v),2), ROUND(MEDIAN(v),2), ROUND(QUANTILE_CONT(v,0.25),2), ROUND(QUANTILE_CONT(v,0.75),2), ROUND(STDDEV_SAMP(v),2) FROM nums;" 2>/dev/null) || stats=""
+            SELECT ROUND(MIN(v),2), ROUND(MAX(v),2), ROUND(AVG(v),2), ROUND(MEDIAN(v),2),
+                   ROUND(QUANTILE_CONT(v,0.25),2), ROUND(QUANTILE_CONT(v,0.75),2), ROUND(STDDEV_SAMP(v),2)
+            FROM nums;" 2>/dev/null) || stats=""
+
         if [ -n "$stats" ]; then
             local mn_v mx_v mean_v med_v p25 p75 std_v
             mn_v=$(echo "$stats" | cut -d',' -f1)
@@ -407,36 +580,67 @@ EOF
             p25=$(echo "$stats" | cut -d',' -f5)
             p75=$(echo "$stats" | cut -d',' -f6)
             std_v=$(echo "$stats" | cut -d',' -f7)
-            out="${out} | min=${mn_v} max=${mx_v} mean=${mean_v} median=${med_v} p25=${p25} p75=${p75}"
 
+            local outliers_json="null"
             if [ -n "$p25" ] && [ -n "$p75" ] && [ "$p25" != "$p75" ] && [ -n "$std_v" ] && [ "$std_v" != "0.00" ]; then
                 if [ "$OUTLIER_METHOD" = "zscore" ]; then
                     local lb ub ocnt
-                    lb=$(echo "scale=2; $mean_v - 3 * $std_v" | bc 2>/dev/null || echo "?")
-                    ub=$(echo "scale=2; $mean_v + 3 * $std_v" | bc 2>/dev/null || echo "?")
-                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "SELECT COUNT(*) FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "?")
-                    out="${out} | outliers=${ocnt} bounds=[${lb},${ub}] (zscore)"
+                    lb=$(echo "scale=2; $mean_v - 3 * $std_v" | bc 2>/dev/null || echo "0")
+                    ub=$(echo "scale=2; $mean_v + 3 * $std_v" | bc 2>/dev/null || echo "0")
+                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "
+                        SELECT COUNT(*) FROM read_csv_auto('/dev/stdin')
+                        WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "0")
+                    ocnt=$(echo "$ocnt" | tr -d ' ')
+                    local ol_json
+                    ol_json=$(jq -nc --argjson count "${ocnt:-0}" --arg lb "$lb" --arg ub "$ub" \
+                        '{count: $count, method: "zscore", bounds: [$lb | tonumber, $ub | tonumber]}')
+                    outliers_json="$ol_json"
                 else
                     local iqr lb ub ocnt
                     iqr=$(echo "scale=2; $p75 - $p25" | bc 2>/dev/null || echo "0")
-                    lb=$(echo "scale=2; $p25 - 1.5 * $iqr" | bc 2>/dev/null || echo "?")
-                    ub=$(echo "scale=2; $p75 + 1.5 * $iqr" | bc 2>/dev/null || echo "?")
-                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "SELECT COUNT(*) FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "?")
-                    out="${out} | outliers=${ocnt} bounds=[${lb},${ub}] (iqr)"
+                    lb=$(echo "scale=2; $p25 - 1.5 * $iqr" | bc 2>/dev/null || echo "0")
+                    ub=$(echo "scale=2; $p75 + 1.5 * $iqr" | bc 2>/dev/null || echo "0")
+                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "
+                        SELECT COUNT(*) FROM read_csv_auto('/dev/stdin')
+                        WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "0")
+                    ocnt=$(echo "$ocnt" | tr -d ' ')
+                    local ol_json
+                    ol_json=$(jq -nc --argjson count "${ocnt:-0}" --arg lb "$lb" --arg ub "$ub" \
+                        '{count: $count, method: "iqr", bounds: [$lb | tonumber, $ub | tonumber]}')
+                    outliers_json="$ol_json"
                 fi
             fi
+
+            local sample
+            sample=$(echo "$result" | tail -n +2 | head -5 | cut -d',' -f1 | tr '\n' ',' | sed 's/,$//')
+            local sample_json
+            sample_json=$(echo "$sample" | tr ',' '\n' | jq -R 'try tonumber // .' | jq -cs '.' 2>/dev/null || echo "[]")
+
+            local json
+            json=$(jq -nc --argjson rows "$row_count" \
+                --argjson min "${mn_v:-0}" --argjson max "${mx_v:-0}" \
+                --argjson mean "${mean_v:-0}" --argjson median "${med_v:-0}" \
+                --argjson p25 "${p25:-0}" --argjson p75 "${p75:-0}" \
+                --argjson stddev "${std_v:-0}" \
+                --argjson outliers "$outliers_json" \
+                --argjson sample "$sample_json" \
+                '{rows: $rows, stats: {min: $min, max: $max, mean: $mean, median: $median, p25: $p25, p75: $p75, stddev: $stddev}, outliers: $outliers, sample: $sample}')
+            json_ok "$json"
+        else
+            local json
+            json=$(jq -nc --argjson rows "$row_count" '{rows: $rows, warning: "could not compute stats"}')
+            json_ok "$json"
         fi
     else
-        out="${out} | categorical"
-        local freq
-        freq=$(echo "$result" | duckdb -csv -c "SELECT \"${first_col}\" AS val, COUNT(*) AS n FROM read_csv_auto('/dev/stdin') GROUP BY val ORDER BY n DESC LIMIT 10;" 2>/dev/null || echo "")
-        [ -n "$freq" ] && out="${out}\n${freq}"
+        local freq_json
+        freq_json=$(echo "$result" | duckdb -json -c "
+            SELECT \"${first_col}\" AS value, COUNT(*) AS n
+            FROM read_csv_auto('/dev/stdin') GROUP BY value ORDER BY n DESC LIMIT 10;" 2>/dev/null || echo "[]")
+        local json
+        json=$(jq -nc --argjson rows "$row_count" --argjson freq "$freq_json" \
+            '{rows: $rows, categorical: true, frequency: $freq}')
+        json_ok "$json"
     fi
-
-    local sample
-    sample=$(echo "$result" | tail -n +2 | head -10 | cut -d',' -f1 | paste -sd ',' -)
-    echo -e "$out"
-    echo "sample: [${sample}]"
 }
 
 # === Chart subcommands ===
@@ -446,7 +650,7 @@ cmd_histogram() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -o|--output) O="$2"; shift 2 ;;
-            --bins) BINS="$2"; shift 2 ;;
+            --bins) BINS="$2"; validate_numeric "$BINS" "--bins"; shift 2 ;;
             --title) TITLE="$2"; shift 2 ;;
             --xlabel) XL="$2"; shift 2 ;;
             --ylabel) YL="$2"; shift 2 ;;
@@ -454,32 +658,46 @@ cmd_histogram() {
             --help) cat <<EOF
 Usage: mentat histogram <datasource> <column> [flags]
 
-  -o, --output PATH  Save PNG (default: ASCII to stdout)
-  --bins N           Number of bins (default: 20)
-  --table NAME       Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help             This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$COL" ] && COL="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$COL" ] && echo "ERROR: column required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$COL" ] && json_error "column required"
+    validate_column "$COL"
 
     dn_open "$DATASOURCE" "$TBL"
-    local sql="WITH s AS(SELECT MIN(CAST(\"${COL}\" AS DOUBLE))AS mn,MAX(CAST(\"${COL}\" AS DOUBLE))AS mx FROM $MENTAT_TABLE_REF WHERE \"${COL}\" IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST(\"${COL}\" AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct FROM $MENTAT_TABLE_REF,s WHERE \"${COL}\" IS NOT NULL GROUP BY b ORDER BY b"
+    local sql
+    sql="WITH s AS(SELECT MIN(CAST(\"${COL}\" AS DOUBLE))AS mn,MAX(CAST(\"${COL}\" AS DOUBLE))AS mx FROM $MENTAT_TABLE_REF WHERE \"${COL}\" IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST(\"${COL}\" AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct FROM $MENTAT_TABLE_REF,s WHERE \"${COL}\" IS NOT NULL GROUP BY b ORDER BY b"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data for histogram" >&2 && exit 1
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data for histogram"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
 
-    local preamble="set boxwidth 0.8 relative; set style fill solid; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
-    local plot_cmd="plot '-' using 1:2 with boxes"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set boxwidth 0.8 relative; set style fill solid; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+        local plot_cmd="plot '-' using 1:2 with boxes"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local bins_json
+    bins_json=$(echo "$data" | duckdb -json -c "
+        SELECT b AS center, pct FROM read_csv_auto('/dev/stdin') ORDER BY b" 2>/dev/null || echo "[]")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --argjson bins "$bins_json" --arg image "$O" '{bins: $bins, image: $image}')
+    else
+        json=$(jq -nc --argjson bins "$bins_json" '{bins: $bins}')
+    fi
+    json_ok "$json"
 }
 
 cmd_scatter() {
@@ -494,33 +712,56 @@ cmd_scatter() {
             --help) cat <<EOF
 Usage: mentat scatter <datasource> <x_col> <y_col> [flags]
 
-  -o, --output PATH  Save PNG (default: ASCII to stdout)
-  --table NAME       Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help             This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$X" ] && X="$1" && shift && continue
                [ -z "$Y" ] && Y="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$X" ] && echo "ERROR: x_col required" >&2 && exit 1
-    [ -z "$Y" ] && echo "ERROR: y_col required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$X" ] && json_error "x_col required"
+    [ -z "$Y" ] && json_error "y_col required"
+    validate_column "$X" "x_col"
+    validate_column "$Y" "y_col"
 
     dn_open "$DATASOURCE" "$TBL"
-    local sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL LIMIT 50000"
+    local sql
+    sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL LIMIT 50000"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
+    rows=$((rows - 1))
 
-    local preamble="set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
-    local plot_cmd="plot '-' using 1:2 with points pt 7 ps 0.5"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+        local plot_cmd="plot '-' using 1:2 with points pt 7 ps 0.5"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local points_json
+    points_json=$(echo "$data" | duckdb -json -c "
+        SELECT * FROM read_csv_auto('/dev/stdin')" 2>/dev/null || echo "[]")
+
+    local corr
+    corr=$(echo "$data" | duckdb -csv -noheader -c "
+        SELECT ROUND(CORR(x, y), 4) FROM read_csv_auto('/dev/stdin')" 2>/dev/null || echo "null")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --argjson points "$points_json" --argjson corr "${corr:-null}" --argjson count "$rows" --arg image "$O" \
+            '{count: $count, correlation: $corr, points: $points, image: $image}')
+    else
+        json=$(jq -nc --argjson points "$points_json" --argjson corr "${corr:-null}" --argjson count "$rows" \
+            '{count: $count, correlation: $corr, points: $points}')
+    fi
+    json_ok "$json"
 }
 
 cmd_bar() {
@@ -535,34 +776,49 @@ cmd_bar() {
             --help) cat <<EOF
 Usage: mentat bar <datasource> <category_col> [value_col] [flags]
 
-  -o, --output PATH  Save PNG (default: ASCII to stdout)
-  --table NAME       Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help             This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$CAT" ] && CAT="$1" && shift && continue
                [ -z "$VAL" ] && VAL="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$CAT" ] && json_error "category_col required"
+    validate_column "$CAT" "category_col"
 
     dn_open "$DATASOURCE" "$TBL"
     local agg
     [ -n "$VAL" ] && agg="ROUND(AVG(CAST(\"${VAL}\" AS DOUBLE)),2) AS n" || agg="COUNT(*) AS n"
-    local sql="SELECT CAST(\"${CAT}\" AS VARCHAR) AS cat, ${agg} FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL ${VAL:+AND \"${VAL}\" IS NOT NULL} GROUP BY cat ORDER BY n DESC LIMIT 50"
+    local sql
+    sql="SELECT CAST(\"${CAT}\" AS VARCHAR) AS cat, ${agg} FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL ${VAL:+AND \"${VAL}\" IS NOT NULL} GROUP BY cat ORDER BY n DESC LIMIT 50"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
 
-    local preamble="set style data histogram; set style histogram cluster gap 1; set style fill solid border -1; set boxwidth 0.8; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
-    local plot_cmd="plot '-' using 2:xtic(1) with boxes"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set style data histogram; set style histogram cluster gap 1; set style fill solid border -1; set boxwidth 0.8; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
+        local plot_cmd="plot '-' using 2:xtic(1) with boxes"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local bars_json
+    bars_json=$(echo "$data" | duckdb -json -c "
+        SELECT cat AS category, n FROM read_csv_auto('/dev/stdin') ORDER BY n DESC" 2>/dev/null || echo "[]")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --argjson bars "$bars_json" --arg image "$O" '{bars: $bars, image: $image}')
+    else
+        json=$(jq -nc --argjson bars "$bars_json" '{bars: $bars}')
+    fi
+    json_ok "$json"
 }
 
 cmd_line() {
@@ -570,7 +826,7 @@ cmd_line() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -o|--output) O="$2"; shift 2 ;;
-            --bucket) BUCKET="$2"; shift 2 ;;
+            --bucket) BUCKET="$2"; validate_bucket "$BUCKET"; shift 2 ;;
             --title) TITLE="$2"; shift 2 ;;
             --xlabel) XL="$2"; shift 2 ;;
             --ylabel) YL="$2"; shift 2 ;;
@@ -578,21 +834,20 @@ cmd_line() {
             --help) cat <<EOF
 Usage: mentat line <datasource> <time_col> <value_col> [flags]
 
-  -o, --output PATH            Save PNG (default: ASCII to stdout)
-  --bucket auto|hourly|daily|weekly|monthly|yearly  (default: auto)
-  --table NAME                 Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help                       This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$TC" ] && TC="$1" && shift && continue
                [ -z "$VC" ] && VC="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$TC" ] && echo "ERROR: time_col required" >&2 && exit 1
-    [ -z "$VC" ] && echo "ERROR: value_col required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$TC" ] && json_error "time_col required"
+    [ -z "$VC" ] && json_error "value_col required"
+    validate_column "$TC" "time_col"
+    validate_column "$VC" "value_col"
 
     dn_open "$DATASOURCE" "$TBL"
 
@@ -608,26 +863,44 @@ EOF
 
     local bucket_unit
     case "$BUCKET" in
-        hourly) bucket_unit="hour" ;;
-        daily)  bucket_unit="day" ;;
-        weekly) bucket_unit="week" ;;
+        hourly)  bucket_unit="hour" ;;
+        daily)   bucket_unit="day" ;;
+        weekly)  bucket_unit="week" ;;
         monthly) bucket_unit="month" ;;
-        yearly) bucket_unit="year" ;;
-        *)      bucket_unit="day" ;;
+        yearly)  bucket_unit="year" ;;
+        *)       bucket_unit="day" ;;
     esac
-    local bucket_select="DATE_TRUNC('${bucket_unit}',CAST(\"${TC}\" AS TIMESTAMP))"
-    local sql="SELECT ${bucket_select} AS ts, ROUND(AVG(CAST(\"${VC}\" AS DOUBLE)),2) AS val FROM $MENTAT_TABLE_REF WHERE \"${TC}\" IS NOT NULL AND \"${VC}\" IS NOT NULL GROUP BY ts ORDER BY ts"
+    local bucket_select
+    bucket_select="DATE_TRUNC('${bucket_unit}',CAST(\"${TC}\" AS TIMESTAMP))"
+    local sql
+    sql="SELECT ${bucket_select} AS ts, ROUND(AVG(CAST(\"${VC}\" AS DOUBLE)),2) AS val FROM $MENTAT_TABLE_REF WHERE \"${TC}\" IS NOT NULL AND \"${VC}\" IS NOT NULL GROUP BY ts ORDER BY ts"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-    echo "# gaps filled with zeros"
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
 
-    local preamble="set key off; set xdata time; set timefmt '%Y-%m-%d %H:%M:%S'; set format x '%Y-%m-%d'; set grid; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
-    local plot_cmd="plot '-' using 1:2 with lines lw 2"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set key off; set xdata time; set timefmt '%Y-%m-%d %H:%M:%S'; set format x '%Y-%m-%d'; set grid; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+        local plot_cmd="plot '-' using 1:2 with lines lw 2"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local points_json
+    points_json=$(echo "$data" | duckdb -json -c "
+        SELECT * FROM read_csv_auto('/dev/stdin')" 2>/dev/null || echo "[]")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --arg bucket "$BUCKET" --argjson points "$points_json" --arg image "$O" \
+            '{bucket: $bucket, points: $points, image: $image}')
+    else
+        json=$(jq -nc --arg bucket "$BUCKET" --argjson points "$points_json" \
+            '{bucket: $bucket, points: $points}')
+    fi
+    json_ok "$json"
 }
 
 cmd_boxplot() {
@@ -642,33 +915,51 @@ cmd_boxplot() {
             --help) cat <<EOF
 Usage: mentat boxplot <datasource> <category_col> <value_col> [flags]
 
-  -o, --output PATH  Save PNG (default: ASCII to stdout)
-  --table NAME       Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help             This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$CAT" ] && CAT="$1" && shift && continue
                [ -z "$VAL" ] && VAL="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
-    [ -z "$VAL" ] && echo "ERROR: value_col required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$CAT" ] && json_error "category_col required"
+    [ -z "$VAL" ] && json_error "value_col required"
+    validate_column "$CAT" "category_col"
+    validate_column "$VAL" "value_col"
 
     dn_open "$DATASOURCE" "$TBL"
-    local sql="SELECT DENSE_RANK() OVER (ORDER BY CAST(\"${CAT}\" AS VARCHAR)) AS g, CAST(\"${CAT}\" AS VARCHAR) AS cat, CAST(\"${VAL}\" AS DOUBLE) AS val FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL AND \"${VAL}\" IS NOT NULL LIMIT 100000"
+    local sql
+    sql="SELECT DENSE_RANK() OVER (ORDER BY CAST(\"${CAT}\" AS VARCHAR)) AS g, CAST(\"${CAT}\" AS VARCHAR) AS cat, CAST(\"${VAL}\" AS DOUBLE) AS val FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL AND \"${VAL}\" IS NOT NULL LIMIT 100000"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
 
-    local preamble="set style data boxplot; set style boxplot outliers pointtype 7; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
-    local plot_cmd="plot '-' using 1:3:xtic(2) with boxplot"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set style data boxplot; set style boxplot outliers pointtype 7; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
+        local plot_cmd="plot '-' using 1:3:xtic(2) with boxplot"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local groups_json
+    groups_json=$(echo "$data" | duckdb -json -c "
+        SELECT cat AS category, MIN(val) AS mn, QUANTILE_CONT(val,0.25) AS q1,
+               MEDIAN(val) AS med, QUANTILE_CONT(val,0.75) AS q3, MAX(val) AS mx
+        FROM read_csv_auto('/dev/stdin') GROUP BY cat ORDER BY cat" 2>/dev/null || echo "[]")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --argjson groups "$groups_json" --arg image "$O" '{groups: $groups, image: $image}')
+    else
+        json=$(jq -nc --argjson groups "$groups_json" '{groups: $groups}')
+    fi
+    json_ok "$json"
 }
 
 cmd_heatmap() {
@@ -683,46 +974,89 @@ cmd_heatmap() {
             --help) cat <<EOF
 Usage: mentat heatmap <datasource> <x_col> <y_col> <z_col> [flags]
 
-  -o, --output PATH  Save PNG (default: ASCII to stdout)
-  --table NAME       Table name (required for SQLite)
-  --title, --xlabel, --ylabel
-  --help             This help
+All output is JSON. See SKILL.md for schema.
 EOF
             exit 0 ;;
+            -*) json_error "unknown flag: $1" ;;
             *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
                [ -z "$X" ] && X="$1" && shift && continue
                [ -z "$Y" ] && Y="$1" && shift && continue
                [ -z "$Z" ] && Z="$1" && shift || break ;;
         esac
     done
-    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
-    [ -z "$X" ] && echo "ERROR: x_col required" >&2 && exit 1
-    [ -z "$Y" ] && echo "ERROR: y_col required" >&2 && exit 1
-    [ -z "$Z" ] && echo "ERROR: z_col required" >&2 && exit 1
+    [ -z "$DATASOURCE" ] && json_error "datasource required"
+    [ -z "$X" ] && json_error "x_col required"
+    [ -z "$Y" ] && json_error "y_col required"
+    [ -z "$Z" ] && json_error "z_col required"
+    validate_column "$X" "x_col"
+    validate_column "$Y" "y_col"
+    validate_column "$Z" "z_col"
 
     dn_open "$DATASOURCE" "$TBL"
-    local sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y, CAST(\"${Z}\" AS DOUBLE) AS z FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL AND \"${Z}\" IS NOT NULL LIMIT 50000"
+    local sql
+    sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y, CAST(\"${Z}\" AS DOUBLE) AS z FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL AND \"${Z}\" IS NOT NULL LIMIT 50000"
     local data
-    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    data=$(run_duckdb "$sql")
     local rows
     rows=$(echo "$data" | wc -l)
-    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
-    data=$(echo "$data" | tail -n +2)
+    [ "$rows" -le 1 ] && json_error "no data"
+    local data_body
+    data_body=$(echo "$data" | tail -n +2)
 
-    local preamble="set view map; set dgrid3d 50,50 gauss; set pm3d interpolate 20,20; set palette defined (0 '#313695',1 '#4575B4',2 '#74ADD1',3 '#ABD9E9',4 '#E0F3F8',5 '#FFFFBF',6 '#FEE090',7 '#FDAE61',8 '#F46D43',9 '#D73027',10 '#A50026'); set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
-    local plot_cmd="splot '-' using 1:2:3 with pm3d notitle"
-    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+    if [ -n "$O" ]; then
+        local preamble="set view map; set dgrid3d 50,50 gauss; set pm3d interpolate 20,20; set palette defined (0 '#313695',1 '#4575B4',2 '#74ADD1',3 '#ABD9E9',4 '#E0F3F8',5 '#FFFFBF',6 '#FEE090',7 '#FDAE61',8 '#F46D43',9 '#D73027',10 '#A50026'); set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+        local plot_cmd="splot '-' using 1:2:3 with pm3d notitle"
+        gnu_render "$data_body" "$preamble" "$plot_cmd" "$O"
+    fi
+
+    local grid_json
+    grid_json=$(echo "$data" | duckdb -json -c "
+        SELECT * FROM read_csv_auto('/dev/stdin')" 2>/dev/null || echo "[]")
+
+    local json
+    if [ -n "$O" ]; then
+        json=$(jq -nc --argjson grid "$grid_json" --arg image "$O" '{grid: $grid, image: $image}')
+    else
+        json=$(jq -nc --argjson grid "$grid_json" '{grid: $grid}')
+    fi
+    json_ok "$json"
 }
 
 # === Dispatch ===
+
+usage() {
+    cat <<EOF
+Usage: mentat <subcommand> [args]
+
+Subcommands:
+  selfcheck           Validate dependencies (duckdb, qsv, gnuplot, jq)
+  inspect <path>      Discover schema (--stats <table> for profiling)
+  query <path> <sql>  Execute SQL, return JSON with stats
+  histogram <path> <col>    Distribution of 1 numeric column
+  scatter <path> <x> <y>    Correlation of 2 numeric columns
+  bar <path> <cat> [<val>]  Categorical frequencies
+  line <path> <time> <val>  Time-series trend
+  boxplot <path> <cat> <val> Categorical vs numeric comparison
+  heatmap <path> <x> <y> <z> 2D density / cross-tab
+
+Global flags:
+  --help, -h    Show this help
+  --version, -v Show version
+
+All output is JSON. See SKILL.md for schema.
+EOF
+}
 
 main() {
     [ $# -eq 0 ] && usage && exit 1
     case "$1" in
         --help|-h) usage; exit 0 ;;
+        --version|-v)
+            jq -nc --arg ver "$MENTAT_VERSION" '{"status":"ok","data":{"version":$ver}}'
+            exit 0 ;;
         selfcheck|inspect|query|histogram|scatter|bar|line|boxplot|heatmap)
             local cmd="$1"; shift; "cmd_$cmd" "$@" ;;
-        *) echo "ERROR: unknown subcommand: $1" >&2; usage; exit 1 ;;
+        *) json_error "unknown subcommand: $1" ;;
     esac
 }
 
