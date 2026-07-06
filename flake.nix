@@ -7,7 +7,12 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    {
+      homeManagerModules = {
+        mentat = import ./modules/home-manager.nix;
+      };
+    }
+    // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
       in

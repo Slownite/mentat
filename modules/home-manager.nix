@@ -30,6 +30,24 @@ in
       default = "iqr";
       description = "Default outlier detection method";
     };
+
+    tokenBudget = lib.mkOption {
+      type = lib.types.int;
+      default = 6000;
+      description = "Soft token target per query";
+    };
+
+    timeseriesBucket = lib.mkOption {
+      type = lib.types.str;
+      default = "auto";
+      description = "Default time-series granularity";
+    };
+
+    logLevel = lib.mkOption {
+      type = lib.types.enum [ "debug" "info" "warn" "error" ];
+      default = "info";
+      description = "Logging level";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -49,6 +67,9 @@ in
       MENTAT_MAX_RETRIES=${toString cfg.maxRetries}
       MENTAT_OUTPUT_DIR=${cfg.outputDir}
       MENTAT_OUTLIER_METHOD=${cfg.outlierMethod}
+      MENTAT_TOKEN_BUDGET=${toString cfg.tokenBudget}
+      MENTAT_TIMESERIES_BUCKET=${cfg.timeseriesBucket}
+      MENTAT_LOG_LEVEL=${cfg.logLevel}
     '';
 
     home.sessionPath = [
