@@ -24,6 +24,8 @@ Script: `~/.agents/skills/mentat/scripts/mentat`. Add to PATH or reference direc
 
 All data flows through pipes — no temp files or scratch directories used.
 
+**Shell compatibility:** The script is `#!/usr/bin/env bash`. If using xonsh (or another non-bash shell), wrap commands in `bash -c 'mentat ...'` to avoid quoting/pipe issues.
+
 ## Critical Rules
 
 - **Auto-generate a plot after every query.** Do not wait for the user to ask. Choose the

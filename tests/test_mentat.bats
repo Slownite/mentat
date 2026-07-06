@@ -81,6 +81,24 @@ teardown() {
     [ "$status" = "error" ]
 }
 
+@test "mentat inspect --stats returns stats for CSV with mixed types" {
+    echo "id,name,age,value" > test.csv
+    echo "1,Alice,30,100.5" >> test.csv
+    echo "2,Bob,25,200.3" >> test.csv
+    echo "3,Charlie,35,150.7" >> test.csv
+    run "$SCRIPTS_DIR/mentat" inspect test.csv --stats data
+    [ "$status" -eq 0 ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local columns
+    columns=$(echo "$output" | jq '.data.columns | length')
+    [ "$columns" -eq 4 ]
+    local rows
+    rows=$(echo "$output" | jq '.data.rows')
+    [ "$rows" -eq 3 ]
+}
+
 # === query ===
 
 @test "mentat query returns stats for numeric data" {
@@ -165,6 +183,80 @@ teardown() {
     local has_data
     has_data=$(echo "$output" | jq 'has("data") and (.data | has("data"))')
     [ "$has_data" = "true" ]
+}
+
+@test "mentat query supports table name substitution" {
+    echo "id,value" > test.csv
+    echo "1,10" >> test.csv
+    echo "2,20" >> test.csv
+    echo "3,30" >> test.csv
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT value FROM test ORDER BY value"
+    [ "$status" -eq 0 ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local rows
+    rows=$(echo "$output" | jq '.data.rows')
+    [ "$rows" -eq 3 ]
+}
+
+@test "mentat query supports --table override" {
+    echo "id,value" > test.csv
+    echo "1,10" >> test.csv
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT value FROM mytbl" --table mytbl
+    [ "$status" -eq 0 ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local rows
+    rows=$(echo "$output" | jq '.data.rows')
+    [ "$rows" -eq 1 ]
+}
+
+@test "mentat query --histogram --output generates PNG" {
+    echo "value" > test.csv
+    for i in $(seq 1 50); do echo "$i" >> test.csv; done
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT value FROM test" --histogram --bins 10 -o test_qhist.png
+    [ "$status" -eq 0 ]
+    [ -f test_qhist.png ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local has_image
+    has_image=$(echo "$output" | jq 'has("data") and (.data | has("image"))')
+    [ "$has_image" = "true" ]
+}
+
+@test "mentat query --timeseries --output generates PNG" {
+    echo "dt,val" > test.csv
+    echo "2024-01-01,10" >> test.csv
+    echo "2024-01-02,20" >> test.csv
+    echo "2024-01-03,15" >> test.csv
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT dt,val FROM test" --timeseries --bucket daily -o test_qts.png
+    [ "$status" -eq 0 ]
+    [ -f test_qts.png ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local has_image
+    has_image=$(echo "$output" | jq 'has("data") and (.data | has("image"))')
+    [ "$has_image" = "true" ]
+}
+
+@test "mentat query --groupby --output generates PNG" {
+    echo "cat,val" > test.csv
+    echo "a,10" >> test.csv
+    echo "b,20" >> test.csv
+    echo "a,15" >> test.csv
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT cat,val FROM test" --groupby cat -o test_qgrp.png
+    [ "$status" -eq 0 ]
+    [ -f test_qgrp.png ]
+    local status
+    status=$(echo "$output" | jq -r '.status')
+    [ "$status" = "ok" ]
+    local has_image
+    has_image=$(echo "$output" | jq 'has("data") and (.data | has("image"))')
+    [ "$has_image" = "true" ]
 }
 
 # === chart commands (PNG output) ===
