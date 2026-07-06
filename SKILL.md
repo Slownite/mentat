@@ -24,6 +24,15 @@ Script: `~/.agents/skills/mentat/scripts/mentat`. Add to PATH or reference direc
 
 All data flows through pipes — no temp files or scratch directories used.
 
+## Critical Rules
+
+- **Auto-generate a plot after every query.** Do not wait for the user to ask. Choose the
+  appropriate chart type based on the data and output it via `--output`.
+- **Never write to `/tmp`.** All plot output paths must be relative paths in the current
+  working directory. Use `--output <filename>.png`, never `--output /tmp/...`.
+- **Never call `duckdb` directly.** Always use the `mentat` CLI script. The agent must
+  never invoke `duckdb`, `gnuplot`, or `qsv` directly — only through `mentat` subcommands.
+
 ## JSON Output Convention
 
 Every command outputs a single JSON object to stdout:
@@ -54,13 +63,20 @@ High-level question (e.g., "what drives churn?"):
 1. `mentat inspect <path>` — discover schema
 2. Propose approach → get user confirmation
 3. `mentat query <path> <sql>` — execute with optional `--timeseries`, `--histogram`, `--groupby`, `--outlier-method`, `--raw`
+4. Auto-generate a plot from the results. Pick the chart type based on data characteristics:
+   - `histogram` for a numeric column distribution
+   - `bar` for categorical frequencies
+   - `line` for time series (if query used `--timeseries`)
+   - `scatter` for two numeric columns with correlation
+   Use a relative output path (e.g., `analysis.png`). Never use `/tmp/`.
 
-Parse `data.stats` for min, max, mean, median, p25, p75, stddev, outliers.
+Parse `data.stats` for min, max, mean, median, p25, p75, stddev, outliers. The `data.image` field from the plot output contains the PNG path.
 
 ### 2. Direct Plot
 
 Explicit chart request:
 - Single command: `mentat <chart-type> <path> <args> [--output PATH]`
+- Always use a relative path for `--output` (never `/tmp/`)
 - JSON response includes chart data; `--output` adds `data.image`
 
 **If user requests a chart type that doesn't match the data, propose a data-appropriate alternative. Never render a misleading chart.**
@@ -98,7 +114,9 @@ Default mode returns `data.stats` (min, max, mean, median, p25, p75, stddev) and
 
 ### Visualization
 
-DuckDB aggregation + optional Gnuplot PNG render. No ASCII output. `--output PATH` saves PNG and includes `"image"` in response.
+Every query is followed by an automatic plot. Pick the right chart type from the table
+below. Always use `--output <relative-path>.png` to save the plot in the working directory.
+Never write to `/tmp/`. Never call `duckdb` or `gnuplot` directly.
 
 | Subcommand | Required Args | Key `data` field |
 |---|---|---|
