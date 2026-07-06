@@ -337,8 +337,8 @@ EOF
             echo "$result" | duckdb -csv -c "
                 WITH data AS (SELECT CAST(\"${first_col}\" AS DOUBLE) AS val FROM read_csv_auto('/dev/stdin') WHERE val IS NOT NULL),
                      bounds AS (SELECT MIN(val) AS mn, MAX(val) AS mx FROM data),
-                     hist AS (SELECT CASE WHEN mx=mn THEN val ELSE FLOOR((val-mn)*${BINS}/NULLIF(mx-mn,0))*((mx-mn)/${BINS})+((mx-mn)/${BINS})/2+mn END AS bc, COUNT(*) AS n FROM data,bounds GROUP BY bc)
-                SELECT ROUND(bc,2) AS bin_center, n FROM hist ORDER BY bc;" 2>/dev/null || echo "ERROR: histogram failed" >&2
+                     hist AS (SELECT CASE WHEN mx=mn THEN val ELSE FLOOR((val-mn)*${BINS}/NULLIF(mx-mn,0))*((mx-mn)/${BINS})+((mx-mn)/${BINS})/2+mn END AS bc, ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct FROM data,bounds GROUP BY bc)
+                SELECT ROUND(bc,2) AS bin_center, pct FROM hist ORDER BY bc;" 2>/dev/null || echo "ERROR: histogram failed" >&2
         else
             echo "$result" | duckdb -csv -c "SELECT \"${first_col}\" AS cat, COUNT(*) AS n FROM read_csv_auto('/dev/stdin') GROUP BY cat ORDER BY n DESC LIMIT 50;" 2>/dev/null
         fi
@@ -442,7 +442,7 @@ EOF
 # === Chart subcommands ===
 
 cmd_histogram() {
-    local DATASOURCE="" COL="" O="" BINS=20 TITLE="Histogram" XL="Value" YL="Count" TBL=""
+    local DATASOURCE="" COL="" O="" BINS=20 TITLE="Histogram" XL="Value" YL="Percent" TBL=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -o|--output) O="$2"; shift 2 ;;
@@ -469,7 +469,7 @@ EOF
     [ -z "$COL" ] && echo "ERROR: column required" >&2 && exit 1
 
     dn_open "$DATASOURCE" "$TBL"
-    local sql="WITH s AS(SELECT MIN(CAST(\"${COL}\" AS DOUBLE))AS mn,MAX(CAST(\"${COL}\" AS DOUBLE))AS mx FROM $MENTAT_TABLE_REF WHERE \"${COL}\" IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST(\"${COL}\" AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,COUNT(*)AS n FROM $MENTAT_TABLE_REF,s WHERE \"${COL}\" IS NOT NULL GROUP BY b ORDER BY b"
+    local sql="WITH s AS(SELECT MIN(CAST(\"${COL}\" AS DOUBLE))AS mn,MAX(CAST(\"${COL}\" AS DOUBLE))AS mx FROM $MENTAT_TABLE_REF WHERE \"${COL}\" IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST(\"${COL}\" AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct FROM $MENTAT_TABLE_REF,s WHERE \"${COL}\" IS NOT NULL GROUP BY b ORDER BY b"
     local data
     data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
     local rows

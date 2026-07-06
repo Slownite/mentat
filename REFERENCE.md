@@ -73,6 +73,24 @@ Announce strategy. Do not ask permission.
 - Re-inspect only on error or explicit "refresh the schema"
 - Each query is independent — no implicit state carried between queries
 
+## Configuration
+
+Settings read in priority order: env vars > `./mentat.config` > `~/.config/mentat/config`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MENTAT_TOKEN_BUDGET` | `6000` | Soft token target per query |
+| `MENTAT_MAX_RETRIES` | `2` | Self-correction retry limit |
+| `MENTAT_OUTLIER_METHOD` | `iqr` | Outlier detection method (`iqr` / `zscore`) |
+| `MENTAT_TIMESERIES_BUCKET` | `auto` | Default time-series granularity |
+| `MENTAT_LOG_LEVEL` | `info` | Logging level |
+
+## Token Budget
+
+Soft target: 6K tokens/query. Schema ~2K, SQL+results ~2K, interpretation ~2K.
+
+For large schemas (>20 tables), use keyword matching on user's question to filter relevance.
+
 ## Directory / Multi-File Input
 
 - Each file = separate queryable table
