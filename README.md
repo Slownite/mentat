@@ -29,7 +29,6 @@ Then in your home-manager config:
     enable = true;
     tokenBudget = 6000;
     maxRetries = 2;
-    outputDir = "./mentat_output";
   };
 }
 ```
@@ -56,9 +55,9 @@ sudo dnf install duckdb gnuplot
 # QSV: download from https://github.com/jqnatividad/qsv/releases
 
 # Verify installation
-~/.agents/skills/mentat/scripts/mentat_selfcheck
+~/.agents/skills/mentat/scripts/mentat selfcheck
 
-# Optional: add scripts to PATH (add to ~/.bashrc or ~/.zshrc)
+# Optional: add scripts dir to PATH (add to ~/.bashrc or ~/.zshrc)
 export PATH="$HOME/.agents/skills/mentat/scripts:$PATH"
 
 # Optional: create config
@@ -80,21 +79,21 @@ Show me a histogram of transaction amounts faceted by region.
 
 ## CLI
 
-Mentat provides helper scripts that the agent invokes during analysis:
+`mentat` is a single dispatcher with subcommands:
 
-| Script | Purpose |
-|--------|---------|
-| `mentat_selfcheck` | Validate required dependencies (DuckDB, QSV, Gnuplot) |
-| `mentat_inspect` | Discover schema from CSV, Parquet, JSON, or SQLite sources |
-| `mentat_query` | Execute SQL via DuckDB and return stats-enriched results |
-| `mentat_histogram` | Histogram (distribution of 1 numeric column) |
-| `mentat_scatter` | Scatter plot (correlation of 2 numeric columns) |
-| `mentat_line` | Line chart (time-series trend) |
-| `mentat_bar` | Bar chart (categorical frequencies) |
-| `mentat_boxplot` | Box plot (categorical vs numeric comparison) |
-| `mentat_heatmap` | Heatmap (2D density / cross-tabulation) |
+| Subcommand | Purpose |
+|---|---|
+| `mentat selfcheck` | Validate required dependencies (DuckDB, QSV, Gnuplot) |
+| `mentat inspect` | Discover schema from CSV, Parquet, JSON, or SQLite sources |
+| `mentat query` | Execute SQL via DuckDB and return stats-enriched results |
+| `mentat histogram` | Histogram (distribution of 1 numeric column) |
+| `mentat scatter` | Scatter plot (correlation of 2 numeric columns) |
+| `mentat line` | Line chart (time-series trend) |
+| `mentat bar` | Bar chart (categorical frequencies) |
+| `mentat boxplot` | Box plot (categorical vs numeric comparison) |
+| `mentat heatmap` | Heatmap (2D density / cross-tabulation) |
 
-Each script supports `--help` for full flag documentation.
+Each subcommand supports `--help` for full flag documentation. Chart subcommands output ASCII to stdout by default; use `--output PATH` to save a PNG.
 
 ## Configuration
 
@@ -104,10 +103,9 @@ Settings are read from (in priority order):
 3. `~/.config/mentat/config` (global)
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `MENTAT_TOKEN_BUDGET` | `6000` | Soft token target per query |
 | `MENTAT_MAX_RETRIES` | `2` | Self-correction retry limit |
-| `MENTAT_OUTPUT_DIR` | `./mentat_output` | Directory for plots and reports |
 | `MENTAT_OUTLIER_METHOD` | `iqr` | Outlier detection method (`iqr` or `zscore`) |
 | `MENTAT_TIMESERIES_BUCKET` | `auto` | Default time-series granularity |
 | `MENTAT_LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
@@ -118,16 +116,8 @@ Settings are read from (in priority order):
 mentat/
 ├── SKILL.md                    # Agent instructions
 ├── REFERENCE.md                # Edge case reference
-├── scripts/                    # Helper scripts
-│   ├── mentat_selfcheck        # Dependency validation
-│   ├── mentat_inspect          # Schema discovery (Phase 1 + 2)
-│   ├── mentat_query            # SQL execution + stats
-│   ├── mentat_histogram        # Histogram chart
-│   ├── mentat_scatter          # Scatter chart
-│   ├── mentat_line             # Line chart
-│   ├── mentat_bar              # Bar chart
-│   ├── mentat_boxplot          # Box plot
-│   └── mentat_heatmap          # Heatmap
+├── scripts/
+│   └── mentat                  # Single dispatcher binary
 ├── config.example              # Example configuration
 ├── flake.nix                   # Nix flake
 ├── modules/

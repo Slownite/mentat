@@ -43,7 +43,7 @@ jobs:
         run: brew install duckdb qsv gnuplot bats-core
 
       - name: Run selfcheck
-        run: ./scripts/mentat_selfcheck
+        run: ./scripts/mentat selfcheck
 
       - name: Run tests
         run: bats tests/ --verbose-run

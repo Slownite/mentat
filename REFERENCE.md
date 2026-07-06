@@ -36,15 +36,9 @@ When tables have no declared foreign keys:
 
 ## Output Structure
 
-```
-./mentat_output/{YYYYMMDD_HHMMSS}_{description}/
-  ├── analysis.md        (optional report)
-  ├── chart_1.png
-  ├── chart_2.png
-  └── queries.sql
-```
+Chart output: ASCII to stdout by default. `--output PATH` saves PNG to the given path (no default output directory).
 
-A `latest` symlink points to the most recent analysis. User handles cleanup.
+A `latest` symlink can be managed by the user. User handles cleanup.
 
 ## Markdown Report
 

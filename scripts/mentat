@@ -1,0 +1,729 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: mentat <subcommand> [args]
+
+Subcommands:
+  selfcheck           Validate dependencies (duckdb, qsv, gnuplot)
+  inspect <path>      Discover schema (--stats <table> for profiling)
+  query <path> <sql>  Execute SQL, return stats-enriched results
+  histogram <path> <col>    Distribution of 1 numeric column
+  scatter <path> <x> <y>    Correlation of 2 numeric columns
+  bar <path> <cat> [<val>]  Categorical frequencies
+  line <path> <time> <val>  Time-series trend
+  boxplot <path> <cat> <val> Categorical vs numeric comparison
+  heatmap <path> <x> <y> <z> 2D density / cross-tab
+
+Global flags:
+  --help             Show this help
+
+Each subcommand supports --help for detailed usage.
+EOF
+}
+
+# === Shared helpers ===
+
+dn_open() {
+    local path="$1"
+    local table="${2:-}"
+    MENTAT_DATASOURCE="$path"
+    MENTAT_TABLE="$table"
+    MENTAT_IS_SQLITE=false
+
+    if [ ! -f "$path" ]; then
+        echo "ERROR: File not found: $path" >&2
+        exit 1
+    fi
+
+    local ext="${path##*.}"
+    case "$ext" in
+        csv)
+            MENTAT_TABLE_REF="read_csv_auto('$path')" ;;
+        parquet)
+            MENTAT_TABLE_REF="'$path'" ;;
+        json)
+            MENTAT_TABLE_REF="read_json_auto('$path')" ;;
+        sqlite|db)
+            MENTAT_IS_SQLITE=true
+            [ -z "$MENTAT_TABLE" ] && echo "ERROR: --table required for SQLite" >&2 && exit 1
+            MENTAT_TABLE_REF="_d.\"$MENTAT_TABLE\"" ;;
+        *)
+            echo "ERROR: unsupported format: .$ext" >&2
+            exit 1 ;;
+    esac
+}
+
+run_duckdb() {
+    local sql="$1"
+    local full_sql
+    if [ "$MENTAT_IS_SQLITE" = "true" ]; then
+        full_sql="ATTACH '${MENTAT_DATASOURCE}' AS _d (TYPE SQLITE, READ_ONLY); ${sql}"
+    else
+        full_sql="$sql"
+    fi
+    duckdb -csv -c "$full_sql" 2>&1
+}
+
+gnu_render() {
+    local data="$1"
+    local preamble="$2"
+    local plot_cmd="$3"
+    local output="${4:-}"
+
+    local ascii_cmd="set terminal dumb 80 25; set datafile separator comma; $preamble; $plot_cmd"
+    echo "$data" | gnuplot -e "$ascii_cmd" 2>/dev/null || true
+
+    if [ -n "$output" ]; then
+        local png_cmd="set terminal pngcairo enhanced font 'sans,10' size 800,600; set output '$output'; set datafile separator comma; $preamble; $plot_cmd"
+        local gperr
+        gperr=$(echo "$data" | gnuplot -e "$png_cmd" 2>&1) || {
+            echo "ERROR: gnuplot failed: $gperr" >&2
+            exit 1
+        }
+        echo "saved: $output"
+    fi
+}
+
+# === Subcommand functions ===
+
+cmd_selfcheck() {
+    local errors=0
+    echo "=== Mentat dependency check ==="
+    echo ""
+    for c in duckdb qsv gnuplot; do
+        if ! command -v "$c" &>/dev/null; then
+            echo "MISSING: $c"
+            errors=1
+        else
+            local ver
+            ver=$("$c" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "found")
+            echo "FOUND: $c ($ver, path: $(command -v "$c"))"
+        fi
+    done
+    echo ""
+    [ $errors -eq 0 ] && echo "All dependencies found." && exit 0
+    echo "ERROR: Missing dependencies. See README for install instructions." >&2
+    exit 1
+}
+
+cmd_inspect() {
+    local DB_PATH=""
+    local DO_STATS=false
+    local STATS_TABLE=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --stats) DO_STATS=true; STATS_TABLE="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat inspect <path> [--stats <table>]
+
+Discover schema of a data source.
+Output: -- filename (N tables, M FK chains)
+        table(col TYPE PK, col2 TYPE FK->ref.col)
+
+  --stats <table>  Row counts, null ratios, distinct counts, ranges
+  --help           This help
+EOF
+            exit 0 ;;
+            *) DB_PATH="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$DB_PATH" ] && echo "ERROR: path required" >&2 && exit 1
+
+    if [ ! -f "$DB_PATH" ] && [ ! -d "$DB_PATH" ]; then
+        echo "ERROR: not found: $DB_PATH" >&2; exit 1
+    fi
+
+    # Phase 2 — stats on a specific table
+    if $DO_STATS; then
+        [ ! -f "$DB_PATH" ] && echo "ERROR: --stats requires a file, not a directory" >&2 && exit 1
+        local ext="${DB_PATH##*.}"
+        [ "$ext" != "sqlite" ] && [ "$ext" != "db" ] && echo "ERROR: --stats only for SQLite" >&2 && exit 1
+
+        local row_count
+        row_count=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM _d.\"${STATS_TABLE}\";" 2>&1) || {
+            echo "ERROR: cannot query table: $row_count" >&2; exit 1
+        }
+        local cols
+        cols=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT name FROM pragma_table_info('${STATS_TABLE}');" 2>/dev/null) || {
+            echo "ERROR: table not found: ${STATS_TABLE}" >&2; exit 1
+        }
+        local null_parts="" distinct_parts="" range_parts=""
+        for col in $cols; do
+            local null_cnt
+            null_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT SUM(CASE WHEN \"${col}\" IS NULL THEN 1 ELSE 0 END) FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo "0")
+            if [ "$row_count" != "0" ] && [ -n "$null_cnt" ] && [ "$null_cnt" != "0" ]; then
+                local pct
+                pct=$(echo "scale=1; $null_cnt * 100 / $row_count" | bc 2>/dev/null || echo "?")
+                null_parts="${null_parts}${col}=${pct}% "
+            fi
+            local distinct_cnt
+            distinct_cnt=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(DISTINCT \"${col}\") FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo "?")
+            [ "$distinct_cnt" != "?" ] && [ "$distinct_cnt" != "$row_count" ] && distinct_parts="${distinct_parts}${col}=${distinct_cnt} "
+            local minmax
+            minmax=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT MIN(CAST(\"${col}\" AS DOUBLE)), MAX(CAST(\"${col}\" AS DOUBLE)) FROM _d.\"${STATS_TABLE}\";" 2>/dev/null || echo ",")
+            local min_val="${minmax%%,*}"
+            local max_val="${minmax#*,}"
+            [ -n "$min_val" ] && [ "$min_val" != "NULL" ] && range_parts="${range_parts}${col}:[${min_val},${max_val}] "
+        done
+        echo "~${STATS_TABLE}: rows=${row_count} nulls:${null_parts}distinct:${distinct_parts}${range_parts}"
+        exit 0
+    fi
+
+    # Phase 1 — schema discovery
+    if [ -d "$DB_PATH" ]; then
+        local count=0
+        for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
+            [ -f "$f" ] && count=$((count + 1))
+        done
+        [ $count -eq 0 ] && echo "ERROR: no supported files in ${DB_PATH}" >&2 && exit 1
+        [ $count -gt 100 ] && echo "Found ${count} files. Showing first 100." >&2
+        echo "-- ${DB_PATH} (${count} files)"
+        local shown=0
+        for f in "$DB_PATH"/*.csv "$DB_PATH"/*.parquet "$DB_PATH"/*.json "$DB_PATH"/*.sqlite "$DB_PATH"/*.db; do
+            [ -f "$f" ] || continue
+            shown=$((shown + 1))
+            [ $shown -gt 100 ] && break
+            cmd_inspect "$f" 2>/dev/null | tail -n +2
+        done
+        exit 0
+    fi
+
+    local ext="${DB_PATH##*.}"
+    local filename
+    filename=$(basename "$DB_PATH")
+    local tablename
+    tablename=$(echo "${filename%.*}" | sed 's/[^a-zA-Z0-9_]/_/g' | sed 's/^\([0-9]\)/_\1/')
+
+    case "$ext" in
+        sqlite|db)
+            local tables
+            tables=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name;" 2>&1) || {
+                echo "ERROR: $tables" >&2; exit 1
+            }
+            [ -z "$tables" ] || [ "$tables" = "name,type" ] && echo "ERROR: no tables" >&2 && exit 1
+            local tcount
+            tcount=$(echo "$tables" | tail -n +2 | wc -l)
+            local fk_total
+            fk_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
+            local ref_total
+            ref_total=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%REFERENCES%' AND sql NOT LIKE '%FOREIGN KEY%' AND name NOT LIKE 'sqlite_%';" 2>/dev/null || echo "0")
+            local fk_all=$((fk_total + ref_total))
+            echo "-- ${filename} (${tcount} tables, ${fk_all} FK chains)"
+            echo "$tables" | tail -n +2 | while IFS=',' read -r tname ttype; do
+                tname=$(echo "$tname" | xargs)
+                local desc
+                desc=$(duckdb -csv -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); DESCRIBE _d.\"${tname}\";" 2>/dev/null) || continue
+                local create_sql
+                create_sql=$(duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS _d (TYPE SQLITE, READ_ONLY); SELECT sql FROM sqlite_master WHERE type='table' AND name='${tname}' AND sql IS NOT NULL;" 2>/dev/null || echo "")
+                local parts=""
+                while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+                    cname=$(echo "$cname" | xargs); ctype=$(echo "$ctype" | xargs); ckey=$(echo "$ckey" | xargs)
+                    [ "$ckey" = "PRI" ] && ctype="${ctype} PK"
+                    if [ -n "$create_sql" ]; then
+                        local col_def
+                        col_def=$(echo "$create_sql" | grep -oE "\"${cname}\"[^,)]*" | head -1 || echo "")
+                        if echo "$col_def" | grep -qi "REFERENCES"; then
+                            local ref_part
+                            ref_part=$(echo "$col_def" | sed 's/.*REFERENCES[[:space:]]*//i' | tr '(' ' ' | tr -d '")' | xargs)
+                            local ref_t
+                            ref_t=$(echo "$ref_part" | awk '{print $1}' 2>/dev/null || echo "")
+                            local ref_c
+                            ref_c=$(echo "$ref_part" | awk '{print $2}' 2>/dev/null || echo "")
+                            [ -n "$ref_t" ] && [ -n "$ref_c" ] && ctype="${ctype} FK->${ref_t}.${ref_c}"
+                        fi
+                    fi
+                    parts="${parts}${cname} ${ctype}, "
+                done <<< "$(echo "$desc" | tail -n +2)"
+                echo "${tname}(${parts%, })"
+            done ;;
+        csv|parquet|json)
+            local rfunc
+            case "$ext" in
+                csv) rfunc="read_csv_auto('${DB_PATH}')" ;;
+                parquet) rfunc="'${DB_PATH}'" ;;
+                json) rfunc="read_json_auto('${DB_PATH}')" ;;
+            esac
+            local desc
+            desc=$(duckdb -csv -c "DESCRIBE SELECT * FROM ${rfunc};" 2>/dev/null) || {
+                echo "ERROR: could not read ${ext}: ${DB_PATH}" >&2; exit 1
+            }
+            local ccount
+            ccount=$(echo "$desc" | tail -n +2 | wc -l)
+            local parts=""
+            while IFS=',' read -r cname ctype cnull ckey cdefault cextra; do
+                cname=$(echo "$cname" | xargs); ctype=$(echo "$ctype" | xargs)
+                parts="${parts}${cname} ${ctype}, "
+            done <<< "$(echo "$desc" | tail -n +2)"
+            echo "-- ${filename} (${ccount} columns)"
+            echo "${tablename}(${parts%, })"
+            if [ "$ext" = "json" ]; then
+                local sample
+                sample=$(duckdb -json -c "SELECT * FROM ${rfunc} LIMIT 1;" 2>/dev/null | head -20 || echo "")
+                [ -n "$sample" ] && [ "$sample" != "[]" ] && echo "  sample: ${sample}"
+            fi ;;
+        *) echo "ERROR: unsupported: .${ext}" >&2; exit 1 ;;
+    esac
+}
+
+cmd_query() {
+    local DB_PATH="" SQL="" MODE="default" BINS=50 GROUPBY_COL="" OUTLIER_METHOD="iqr" RAW=false HISTOGRAM=false TIMESERIES=false TIMESERIES_BUCKET="auto"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --histogram) HISTOGRAM=true; MODE="histogram"; shift ;;
+            --bins) BINS="$2"; shift 2 ;;
+            --groupby) MODE="groupby"; GROUPBY_COL="$2"; shift 2 ;;
+            --timeseries) TIMESERIES=true; MODE="timeseries"; shift ;;
+            --bucket) TIMESERIES_BUCKET="$2"; shift 2 ;;
+            --outlier-method) OUTLIER_METHOD="$2"; shift 2 ;;
+            --raw) RAW=true; MODE="raw"; shift ;;
+            --table) TABLE="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat query <path> <sql> [flags]
+
+  --histogram [--bins=N]    Binned distribution of first numeric column
+  --groupby <col>           Per-group stats
+  --timeseries [--bucket=auto|hourly|daily|weekly|monthly|yearly]
+  --outlier-method=iqr|zscore  (default: iqr)
+  --raw                     Return raw rows (capped at 1000)
+  --table NAME              Required for SQLite
+  --help                    This help
+EOF
+            exit 0 ;;
+            *)
+                [ -z "$DB_PATH" ] && DB_PATH="$1" && shift && continue
+                [ -z "$SQL" ] && SQL="$1" && shift || break ;;
+        esac
+    done
+
+    [ -z "$DB_PATH" ] && echo "ERROR: path required" >&2 && exit 1
+    [ -z "$SQL" ] && echo "ERROR: SQL required" >&2 && exit 1
+
+    local TABLE="${TABLE:-}"
+    dn_open "$DB_PATH" "$TABLE"
+
+    if $RAW; then
+        local raw_out
+        raw_out=$(run_duckdb "$SQL" 2>&1) || { echo "$raw_out" >&2; exit 1; }
+        echo "$raw_out" | head -1001
+        local rc
+        rc=$(echo "$raw_out" | tail -n +2 | head -1000 | wc -l)
+        echo "# raw rows: ${rc} (capped at 1000)"
+        exit 0
+    fi
+
+    local result
+    result=$(run_duckdb "$SQL" 2>&1) || { echo "$result" >&2; exit 1; }
+
+    local row_count
+    row_count=$(echo "$result" | tail -n +2 | wc -l)
+    local header
+    header=$(echo "$result" | head -1)
+
+    [ "$row_count" -eq 0 ] && echo "rows=0" && echo "No matching data found." && exit 0
+    [ "$row_count" -eq 1 ] && echo "rows=1" && echo "WARNING: Only 1 row." && echo "sample: $(echo "$result" | tail -1)" && exit 0
+
+    local first_col
+    first_col=$(echo "$header" | cut -d',' -f1)
+
+    if $HISTOGRAM; then
+        local is_num
+        is_num=$(echo "$result" | duckdb -csv -noheader -c "SELECT CASE WHEN COUNT(*) > 0 THEN 'true' ELSE 'false' END FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
+        if [ "$is_num" = "true" ]; then
+            echo "$result" | duckdb -csv -c "
+                WITH data AS (SELECT CAST(\"${first_col}\" AS DOUBLE) AS val FROM read_csv_auto('/dev/stdin') WHERE val IS NOT NULL),
+                     bounds AS (SELECT MIN(val) AS mn, MAX(val) AS mx FROM data),
+                     hist AS (SELECT CASE WHEN mx=mn THEN val ELSE FLOOR((val-mn)*${BINS}/NULLIF(mx-mn,0))*((mx-mn)/${BINS})+((mx-mn)/${BINS})/2+mn END AS bc, COUNT(*) AS n FROM data,bounds GROUP BY bc)
+                SELECT ROUND(bc,2) AS bin_center, n FROM hist ORDER BY bc;" 2>/dev/null || echo "ERROR: histogram failed" >&2
+        else
+            echo "$result" | duckdb -csv -c "SELECT \"${first_col}\" AS cat, COUNT(*) AS n FROM read_csv_auto('/dev/stdin') GROUP BY cat ORDER BY n DESC LIMIT 50;" 2>/dev/null
+        fi
+        exit 0
+    fi
+
+    if $TIMESERIES; then
+        local second_col
+        second_col=$(echo "$header" | cut -d',' -f2)
+        if [ "$TIMESERIES_BUCKET" = "auto" ]; then
+            local bucket
+            bucket=$(echo "$result" | duckdb -csv -noheader -c "
+                WITH data AS (SELECT TRY_CAST(\"${first_col}\" AS TIMESTAMP) AS ts FROM read_csv_auto('/dev/stdin') WHERE ts IS NOT NULL)
+                SELECT CASE
+                    WHEN DATE_DIFF('day',MIN(ts),MAX(ts))<=7 THEN 'hourly'
+                    WHEN DATE_DIFF('day',MIN(ts),MAX(ts))<=90 THEN 'daily'
+                    WHEN DATE_DIFF('day',MIN(ts),MAX(ts))<=730 THEN 'weekly'
+                    WHEN DATE_DIFF('day',MIN(ts),MAX(ts))<=3650 THEN 'monthly'
+                    ELSE 'yearly' END FROM data;" 2>/dev/null || echo "daily")
+            TIMESERIES_BUCKET="$bucket"
+        fi
+        local bucket_expr
+        case "$TIMESERIES_BUCKET" in
+            hourly) bucket_expr="DATE_TRUNC('hour',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            daily)  bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            weekly) bucket_expr="DATE_TRUNC('week',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            monthly)bucket_expr="DATE_TRUNC('month',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            yearly) bucket_expr="DATE_TRUNC('year',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+            *)      bucket_expr="DATE_TRUNC('day',CAST(\"${first_col}\" AS TIMESTAMP))" ;;
+        esac
+        echo "# timeseries bucket: ${TIMESERIES_BUCKET}"
+        echo "$result" | duckdb -csv -c "
+            WITH data AS (SELECT ${bucket_expr} AS ts_bucket, TRY_CAST(\"${second_col}\" AS DOUBLE) AS val FROM read_csv_auto('/dev/stdin') WHERE val IS NOT NULL),
+                 agg AS (SELECT ts_bucket, COUNT(*) AS n, ROUND(AVG(val),2) AS mean, MEDIAN(val) AS median, MIN(val) AS mn, MAX(val) AS mx FROM data GROUP BY ts_bucket)
+            SELECT COALESCE(ts_bucket,'epoch') AS ts_bucket, COALESCE(n,0) AS n, COALESCE(mean,0) AS mean, COALESCE(median,0) AS median, COALESCE(mn,0) AS mn, COALESCE(mx,0) AS mx FROM agg ORDER BY ts_bucket;" 2>/dev/null || echo "ERROR: timeseries failed" >&2
+        echo "# gaps filled with zeros"
+        exit 0
+    fi
+
+    if [ "$MODE" = "groupby" ] && [ -n "$GROUPBY_COL" ]; then
+        local val_col
+        val_col=$(echo "$header" | cut -d',' -f2)
+        echo "$result" | duckdb -csv -c "
+            SELECT \"${GROUPBY_COL}\" AS grp, COUNT(*) AS n, ROUND(AVG(TRY_CAST(\"${val_col}\" AS DOUBLE)),2) AS mean,
+                   MEDIAN(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS med, MIN(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS mn, MAX(TRY_CAST(\"${val_col}\" AS DOUBLE)) AS mx
+            FROM read_csv_auto('/dev/stdin') GROUP BY grp ORDER BY n DESC;" 2>/dev/null
+        exit 0
+    fi
+
+    # Default mode: stats on first numeric column
+    local is_num
+    is_num=$(echo "$result" | duckdb -csv -noheader -c "SELECT CASE WHEN COUNT(*)>0 THEN 'true' ELSE 'false' END FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) IS NOT NULL;" 2>/dev/null || echo "false")
+
+    local out="rows=${row_count}"
+    if [ "$is_num" = "true" ]; then
+        local stats
+        stats=$(echo "$result" | duckdb -csv -noheader -c "
+            WITH nums AS (SELECT TRY_CAST(\"${first_col}\" AS DOUBLE) AS v FROM read_csv_auto('/dev/stdin') WHERE v IS NOT NULL)
+            SELECT ROUND(MIN(v),2), ROUND(MAX(v),2), ROUND(AVG(v),2), ROUND(MEDIAN(v),2), ROUND(QUANTILE_CONT(v,0.25),2), ROUND(QUANTILE_CONT(v,0.75),2), ROUND(STDDEV_SAMP(v),2) FROM nums;" 2>/dev/null) || stats=""
+        if [ -n "$stats" ]; then
+            local mn_v mx_v mean_v med_v p25 p75 std_v
+            mn_v=$(echo "$stats" | cut -d',' -f1)
+            mx_v=$(echo "$stats" | cut -d',' -f2)
+            mean_v=$(echo "$stats" | cut -d',' -f3)
+            med_v=$(echo "$stats" | cut -d',' -f4)
+            p25=$(echo "$stats" | cut -d',' -f5)
+            p75=$(echo "$stats" | cut -d',' -f6)
+            std_v=$(echo "$stats" | cut -d',' -f7)
+            out="${out} | min=${mn_v} max=${mx_v} mean=${mean_v} median=${med_v} p25=${p25} p75=${p75}"
+
+            if [ -n "$p25" ] && [ -n "$p75" ] && [ "$p25" != "$p75" ] && [ -n "$std_v" ] && [ "$std_v" != "0.00" ]; then
+                if [ "$OUTLIER_METHOD" = "zscore" ]; then
+                    local lb ub ocnt
+                    lb=$(echo "scale=2; $mean_v - 3 * $std_v" | bc 2>/dev/null || echo "?")
+                    ub=$(echo "scale=2; $mean_v + 3 * $std_v" | bc 2>/dev/null || echo "?")
+                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "SELECT COUNT(*) FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "?")
+                    out="${out} | outliers=${ocnt} bounds=[${lb},${ub}] (zscore)"
+                else
+                    local iqr lb ub ocnt
+                    iqr=$(echo "scale=2; $p75 - $p25" | bc 2>/dev/null || echo "0")
+                    lb=$(echo "scale=2; $p25 - 1.5 * $iqr" | bc 2>/dev/null || echo "?")
+                    ub=$(echo "scale=2; $p75 + 1.5 * $iqr" | bc 2>/dev/null || echo "?")
+                    ocnt=$(echo "$result" | duckdb -csv -noheader -c "SELECT COUNT(*) FROM read_csv_auto('/dev/stdin') WHERE TRY_CAST(\"${first_col}\" AS DOUBLE) < ${lb} OR TRY_CAST(\"${first_col}\" AS DOUBLE) > ${ub};" 2>/dev/null || echo "?")
+                    out="${out} | outliers=${ocnt} bounds=[${lb},${ub}] (iqr)"
+                fi
+            fi
+        fi
+    else
+        out="${out} | categorical"
+        local freq
+        freq=$(echo "$result" | duckdb -csv -c "SELECT \"${first_col}\" AS val, COUNT(*) AS n FROM read_csv_auto('/dev/stdin') GROUP BY val ORDER BY n DESC LIMIT 10;" 2>/dev/null || echo "")
+        [ -n "$freq" ] && out="${out}\n${freq}"
+    fi
+
+    local sample
+    sample=$(echo "$result" | tail -n +2 | head -10 | cut -d',' -f1 | paste -sd ',' -)
+    echo -e "$out"
+    echo "sample: [${sample}]"
+}
+
+# === Chart subcommands ===
+
+cmd_histogram() {
+    local DATASOURCE="" COL="" O="" BINS=20 TITLE="Histogram" XL="Value" YL="Count" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --bins) BINS="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat histogram <datasource> <column> [flags]
+
+  -o, --output PATH  Save PNG (default: ASCII to stdout)
+  --bins N           Number of bins (default: 20)
+  --table NAME       Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help             This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$COL" ] && COL="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$COL" ] && echo "ERROR: column required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+    local sql="WITH s AS(SELECT MIN(CAST(\"${COL}\" AS DOUBLE))AS mn,MAX(CAST(\"${COL}\" AS DOUBLE))AS mx FROM $MENTAT_TABLE_REF WHERE \"${COL}\" IS NOT NULL)SELECT ROUND(mn+(FLOOR((CAST(\"${COL}\" AS DOUBLE)-mn)*$BINS/NULLIF(mx-mn,0))+0.5)*(mx-mn)/$BINS,2)AS b,COUNT(*)AS n FROM $MENTAT_TABLE_REF,s WHERE \"${COL}\" IS NOT NULL GROUP BY b ORDER BY b"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data for histogram" >&2 && exit 1
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set boxwidth 0.8 relative; set style fill solid; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+    local plot_cmd="plot '-' using 1:2 with boxes"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+cmd_scatter() {
+    local DATASOURCE="" X="" Y="" O="" TITLE="Scatter" XL="X" YL="Y" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat scatter <datasource> <x_col> <y_col> [flags]
+
+  -o, --output PATH  Save PNG (default: ASCII to stdout)
+  --table NAME       Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help             This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$X" ] && X="$1" && shift && continue
+               [ -z "$Y" ] && Y="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$X" ] && echo "ERROR: x_col required" >&2 && exit 1
+    [ -z "$Y" ] && echo "ERROR: y_col required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+    local sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL LIMIT 50000"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+    local plot_cmd="plot '-' using 1:2 with points pt 7 ps 0.5"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+cmd_bar() {
+    local DATASOURCE="" CAT="" VAL="" O="" TITLE="Bar Chart" XL="Category" YL="Count" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat bar <datasource> <category_col> [value_col] [flags]
+
+  -o, --output PATH  Save PNG (default: ASCII to stdout)
+  --table NAME       Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help             This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$CAT" ] && CAT="$1" && shift && continue
+               [ -z "$VAL" ] && VAL="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+    local agg
+    [ -n "$VAL" ] && agg="ROUND(AVG(CAST(\"${VAL}\" AS DOUBLE)),2) AS n" || agg="COUNT(*) AS n"
+    local sql="SELECT CAST(\"${CAT}\" AS VARCHAR) AS cat, ${agg} FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL ${VAL:+AND \"${VAL}\" IS NOT NULL} GROUP BY cat ORDER BY n DESC LIMIT 50"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set style data histogram; set style histogram cluster gap 1; set style fill solid border -1; set boxwidth 0.8; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
+    local plot_cmd="plot '-' using 2:xtic(1) with boxes"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+cmd_line() {
+    local DATASOURCE="" TC="" VC="" O="" BUCKET="auto" TITLE="Line Chart" XL="Time" YL="Value" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --bucket) BUCKET="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat line <datasource> <time_col> <value_col> [flags]
+
+  -o, --output PATH            Save PNG (default: ASCII to stdout)
+  --bucket auto|hourly|daily|weekly|monthly|yearly  (default: auto)
+  --table NAME                 Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help                       This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$TC" ] && TC="$1" && shift && continue
+               [ -z "$VC" ] && VC="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$TC" ] && echo "ERROR: time_col required" >&2 && exit 1
+    [ -z "$VC" ] && echo "ERROR: value_col required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+
+    if [ "$BUCKET" = "auto" ]; then
+        local days
+        days=$(run_duckdb "SELECT DATE_DIFF('day',MIN(CAST(\"${TC}\" AS TIMESTAMP)),MAX(CAST(\"${TC}\" AS TIMESTAMP))) FROM $MENTAT_TABLE_REF WHERE \"${TC}\" IS NOT NULL" | tail -1)
+        if [ "$days" -le 7 ]; then BUCKET="hourly"
+        elif [ "$days" -le 90 ]; then BUCKET="daily"
+        elif [ "$days" -le 730 ]; then BUCKET="weekly"
+        elif [ "$days" -le 3650 ]; then BUCKET="monthly"
+        else BUCKET="yearly"; fi
+    fi
+
+    local bucket_unit
+    case "$BUCKET" in
+        hourly) bucket_unit="hour" ;;
+        daily)  bucket_unit="day" ;;
+        weekly) bucket_unit="week" ;;
+        monthly) bucket_unit="month" ;;
+        yearly) bucket_unit="year" ;;
+        *)      bucket_unit="day" ;;
+    esac
+    local bucket_select="DATE_TRUNC('${bucket_unit}',CAST(\"${TC}\" AS TIMESTAMP))"
+    local sql="SELECT ${bucket_select} AS ts, ROUND(AVG(CAST(\"${VC}\" AS DOUBLE)),2) AS val FROM $MENTAT_TABLE_REF WHERE \"${TC}\" IS NOT NULL AND \"${VC}\" IS NOT NULL GROUP BY ts ORDER BY ts"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+    echo "# gaps filled with zeros"
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set key off; set xdata time; set timefmt '%Y-%m-%d %H:%M:%S'; set format x '%Y-%m-%d'; set grid; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+    local plot_cmd="plot '-' using 1:2 with lines lw 2"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+cmd_boxplot() {
+    local DATASOURCE="" CAT="" VAL="" O="" TITLE="Boxplot" XL="Category" YL="Value" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat boxplot <datasource> <category_col> <value_col> [flags]
+
+  -o, --output PATH  Save PNG (default: ASCII to stdout)
+  --table NAME       Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help             This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$CAT" ] && CAT="$1" && shift && continue
+               [ -z "$VAL" ] && VAL="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$CAT" ] && echo "ERROR: category_col required" >&2 && exit 1
+    [ -z "$VAL" ] && echo "ERROR: value_col required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+    local sql="SELECT DENSE_RANK() OVER (ORDER BY CAST(\"${CAT}\" AS VARCHAR)) AS g, CAST(\"${CAT}\" AS VARCHAR) AS cat, CAST(\"${VAL}\" AS DOUBLE) AS val FROM $MENTAT_TABLE_REF WHERE \"${CAT}\" IS NOT NULL AND \"${VAL}\" IS NOT NULL LIMIT 100000"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set style data boxplot; set style boxplot outliers pointtype 7; set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'; set xtics rotate by -45"
+    local plot_cmd="plot '-' using 1:3:xtic(2) with boxplot"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+cmd_heatmap() {
+    local DATASOURCE="" X="" Y="" Z="" O="" TITLE="Heatmap" XL="X" YL="Y" TBL=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o|--output) O="$2"; shift 2 ;;
+            --title) TITLE="$2"; shift 2 ;;
+            --xlabel) XL="$2"; shift 2 ;;
+            --ylabel) YL="$2"; shift 2 ;;
+            --table) TBL="$2"; shift 2 ;;
+            --help) cat <<EOF
+Usage: mentat heatmap <datasource> <x_col> <y_col> <z_col> [flags]
+
+  -o, --output PATH  Save PNG (default: ASCII to stdout)
+  --table NAME       Table name (required for SQLite)
+  --title, --xlabel, --ylabel
+  --help             This help
+EOF
+            exit 0 ;;
+            *) [ -z "$DATASOURCE" ] && DATASOURCE="$1" && shift && continue
+               [ -z "$X" ] && X="$1" && shift && continue
+               [ -z "$Y" ] && Y="$1" && shift && continue
+               [ -z "$Z" ] && Z="$1" && shift || break ;;
+        esac
+    done
+    [ -z "$DATASOURCE" ] && echo "ERROR: datasource required" >&2 && exit 1
+    [ -z "$X" ] && echo "ERROR: x_col required" >&2 && exit 1
+    [ -z "$Y" ] && echo "ERROR: y_col required" >&2 && exit 1
+    [ -z "$Z" ] && echo "ERROR: z_col required" >&2 && exit 1
+
+    dn_open "$DATASOURCE" "$TBL"
+    local sql="SELECT CAST(\"${X}\" AS DOUBLE) AS x, CAST(\"${Y}\" AS DOUBLE) AS y, CAST(\"${Z}\" AS DOUBLE) AS z FROM $MENTAT_TABLE_REF WHERE \"${X}\" IS NOT NULL AND \"${Y}\" IS NOT NULL AND \"${Z}\" IS NOT NULL LIMIT 50000"
+    local data
+    data=$(run_duckdb "$sql" 2>&1) || { echo "ERROR: $data" >&2; exit 1; }
+    local rows
+    rows=$(echo "$data" | wc -l)
+    [ "$rows" -le 1 ] && echo "ERROR: no data" >&2 && exit 1
+    data=$(echo "$data" | tail -n +2)
+
+    local preamble="set view map; set dgrid3d 50,50 gauss; set pm3d interpolate 20,20; set palette defined (0 '#313695',1 '#4575B4',2 '#74ADD1',3 '#ABD9E9',4 '#E0F3F8',5 '#FFFFBF',6 '#FEE090',7 '#FDAE61',8 '#F46D43',9 '#D73027',10 '#A50026'); set key off; set title '${TITLE}'; set xlabel '${XL}'; set ylabel '${YL}'"
+    local plot_cmd="splot '-' using 1:2:3 with pm3d notitle"
+    gnu_render "$data" "$preamble" "$plot_cmd" "$O"
+}
+
+# === Dispatch ===
+
+main() {
+    [ $# -eq 0 ] && usage && exit 1
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        selfcheck|inspect|query|histogram|scatter|bar|line|boxplot|heatmap)
+            local cmd="$1"; shift; "cmd_$cmd" "$@" ;;
+        *) echo "ERROR: unknown subcommand: $1" >&2; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

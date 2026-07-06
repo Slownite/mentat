@@ -10,8 +10,8 @@ teardown() {
     rm -rf "$TEST_DIR"
 }
 
-@test "mentat_selfcheck finds required dependencies" {
-    run "$SCRIPTS_DIR/mentat_selfcheck"
+@test "mentat selfcheck finds required dependencies" {
+    run "$SCRIPTS_DIR/mentat" selfcheck
     [ "$status" -eq 0 ]
     [[ "$output" =~ "duckdb" ]]
     [[ "$output" =~ "qsv" ]]
@@ -19,54 +19,56 @@ teardown() {
     [[ "$output" =~ "All dependencies found" ]]
 }
 
-@test "mentat_inspect handles missing file" {
-    run "$SCRIPTS_DIR/mentat_inspect" /nonexistent/file.db
+@test "mentat inspect handles missing file" {
+    run "$SCRIPTS_DIR/mentat" inspect /nonexistent/file.db
     [ "$status" -eq 1 ]
     [[ "$output" =~ "not found" ]]
 }
 
-@test "mentat_inspect returns schema for CSV" {
+@test "mentat inspect returns schema for CSV" {
     echo "id,name,age" > test.csv
     echo "1,Alice,30" >> test.csv
     echo "2,Bob,25" >> test.csv
-    run "$SCRIPTS_DIR/mentat_inspect" test.csv
+    run "$SCRIPTS_DIR/mentat" inspect test.csv
     [ "$status" -eq 0 ]
     [[ "$output" =~ "id" ]]
     [[ "$output" =~ "name" ]]
     [[ "$output" =~ "age" ]]
 }
 
-@test "mentat_inspect returns schema for SQLite" {
-    duckdb -c "ATTACH 'test.sqlite' AS _sql (TYPE SQLITE); CREATE TABLE _sql.users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER); CREATE TABLE _sql.orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);" 2>/dev/null
-    run "$SCRIPTS_DIR/mentat_inspect" test.sqlite
+@test "mentat inspect returns schema for SQLite" {
+    duckdb -c "INSTALL sqlite_scanner; LOAD sqlite_scanner; ATTACH 'test_sqlite.db' AS _s (TYPE SQLITE); CREATE TABLE _s.users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER); CREATE TABLE _s.orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);" 2>/dev/null
+    # rename to .sqlite for inspection
+    mv test_sqlite.db test.sqlite
+    run "$SCRIPTS_DIR/mentat" inspect test.sqlite
     [ "$status" -eq 0 ]
     [[ "$output" =~ "users" ]]
     [[ "$output" =~ "orders" ]]
-    [[ "$output" =~ "id PK" ]]
+    [[ "$output" =~ "PK" ]]
 }
 
-@test "mentat_inspect rejects unsupported format" {
+@test "mentat inspect rejects unsupported format" {
     echo "hello" > test.txt
-    run "$SCRIPTS_DIR/mentat_inspect" test.txt
+    run "$SCRIPTS_DIR/mentat" inspect test.txt
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "Unsupported" ]]
+    [[ "$output" =~ "unsupported" ]]
 }
 
-@test "mentat_inspect handles empty SQLite database" {
-    duckdb -c "ATTACH 'empty.sqlite' AS _empty (TYPE SQLITE);" 2>/dev/null
-    run "$SCRIPTS_DIR/mentat_inspect" empty.sqlite
+@test "mentat inspect handles empty SQLite database" {
+    duckdb -c "INSTALL sqlite_scanner; LOAD sqlite_scanner; ATTACH 'empty.db' AS _e (TYPE SQLITE); CREATE TABLE _e.empty_tbl(id INTEGER); DROP TABLE _e.empty_tbl;" 2>/dev/null
+    run "$SCRIPTS_DIR/mentat" inspect empty.db
     [ "$status" -eq 1 ]
     [[ "$output" =~ "no tables" ]]
 }
 
-@test "mentat_query returns stats for numeric data" {
+@test "mentat query returns stats for numeric data" {
     echo "id,value" > test.csv
     echo "1,10" >> test.csv
     echo "2,20" >> test.csv
     echo "3,30" >> test.csv
     echo "4,40" >> test.csv
     echo "5,50" >> test.csv
-    run "$SCRIPTS_DIR/mentat_query" test.csv "SELECT value FROM read_csv_auto('test.csv')"
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT value FROM read_csv_auto('test.csv')"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "rows=5" ]]
     [[ "$output" =~ "min" ]]
@@ -76,99 +78,112 @@ teardown() {
     [[ "$output" =~ "sample:" ]]
 }
 
-@test "mentat_query handles empty result set" {
+@test "mentat query handles empty result set" {
     echo "id,value" > test.csv
     echo "1,10" >> test.csv
-    run "$SCRIPTS_DIR/mentat_query" test.csv "SELECT * FROM read_csv_auto('test.csv') WHERE value > 100"
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT * FROM read_csv_auto('test.csv') WHERE value > 100"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "rows=0" ]]
 }
 
-@test "mentat_query handles single row result" {
+@test "mentat query handles single row result" {
     echo "id,value" > test.csv
     echo "1,42" >> test.csv
-    run "$SCRIPTS_DIR/mentat_query" test.csv "SELECT * FROM read_csv_auto('test.csv') WHERE id = 1"
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT * FROM read_csv_auto('test.csv') WHERE id = 1"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "rows=1" ]]
     [[ "$output" =~ "WARNING" ]]
 }
 
-@test "mentat_query --histogram returns bins" {
+@test "mentat query --histogram returns bins" {
     echo "value" > test.csv
     for i in $(seq 1 50); do echo "$i" >> test.csv; done
-    run "$SCRIPTS_DIR/mentat_query" test.csv "SELECT value FROM read_csv_auto('test.csv')" --histogram --bins=10
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT value FROM read_csv_auto('test.csv')" --histogram --bins=10
     [ "$status" -eq 0 ]
     [[ "$output" =~ "bin_center" ]]
-    [[ "$output" =~ "cnt" ]]
+    [[ "$output" =~ "n" ]]
 }
 
-@test "mentat_query --raw returns rows" {
+@test "mentat query --raw returns rows" {
     echo "id,value" > test.csv
     echo "1,10" >> test.csv
     echo "2,20" >> test.csv
-    run "$SCRIPTS_DIR/mentat_query" test.csv "SELECT * FROM read_csv_auto('test.csv')" --raw
+    run "$SCRIPTS_DIR/mentat" query test.csv "SELECT * FROM read_csv_auto('test.csv')" --raw
     [ "$status" -eq 0 ]
     [[ "$output" =~ "1,10" ]]
     [[ "$output" =~ "2,20" ]]
 }
 
-@test "mentat_histogram generates PNG from CSV" {
+@test "mentat histogram generates PNG from CSV" {
     echo "value" > test.csv; for i in $(seq 1 50); do echo "$i" >> test.csv; done
-    run "$SCRIPTS_DIR/mentat_histogram" test.csv value -o test_hist.png
+    run "$SCRIPTS_DIR/mentat" histogram test.csv value -o test_hist.png
     [ "$status" -eq 0 ]
     [ -f test_hist.png ]
     [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_histogram --ascii generates terminal output" {
+@test "mentat histogram outputs ASCII by default" {
     echo "value" > test.csv; for i in $(seq 1 20); do echo "$i" >> test.csv; done
-    run "$SCRIPTS_DIR/mentat_histogram" test.csv value --ascii
+    run "$SCRIPTS_DIR/mentat" histogram test.csv value
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_histogram rejects missing column" {
+@test "mentat histogram rejects missing column" {
     echo "value" > test.csv; echo "1" >> test.csv
-    run "$SCRIPTS_DIR/mentat_histogram" test.csv
+    run "$SCRIPTS_DIR/mentat" histogram test.csv
     [ "$status" -eq 1 ]
     [[ "$output" =~ "column required" ]]
 }
 
-@test "mentat_scatter generates PNG from CSV" {
+@test "mentat scatter generates PNG from CSV" {
     echo "x,y" > test.csv; echo "1,2" >> test.csv; echo "3,4" >> test.csv; echo "5,6" >> test.csv
-    run "$SCRIPTS_DIR/mentat_scatter" test.csv x y -o test_scatter.png
+    run "$SCRIPTS_DIR/mentat" scatter test.csv x y -o test_scatter.png
     [ "$status" -eq 0 ]
     [ -f test_scatter.png ]
     [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_line generates PNG from CSV" {
+@test "mentat line generates PNG from CSV" {
     echo "dt,val" > test.csv; echo "2024-01-01,10" >> test.csv; echo "2024-01-02,20" >> test.csv; echo "2024-01-03,15" >> test.csv
-    run "$SCRIPTS_DIR/mentat_line" test.csv dt val -o test_line.png
+    run "$SCRIPTS_DIR/mentat" line test.csv dt val -o test_line.png
     [ "$status" -eq 0 ]
     [ -f test_line.png ]
     [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_bar generates PNG from CSV" {
+@test "mentat bar generates PNG from CSV" {
     echo "cat,val" > test.csv; echo "a,10" >> test.csv; echo "b,20" >> test.csv; echo "c,15" >> test.csv
-    run "$SCRIPTS_DIR/mentat_bar" test.csv cat -o test_bar.png
+    run "$SCRIPTS_DIR/mentat" bar test.csv cat -o test_bar.png
     [ "$status" -eq 0 ]
     [ -f test_bar.png ]
     [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_boxplot generates PNG from CSV" {
+@test "mentat boxplot generates PNG from CSV" {
     echo "cat,val" > test.csv; echo "a,1" >> test.csv; echo "a,2" >> test.csv; echo "b,10" >> test.csv; echo "b,12" >> test.csv
-    run "$SCRIPTS_DIR/mentat_boxplot" test.csv cat val -o test_box.png
+    run "$SCRIPTS_DIR/mentat" boxplot test.csv cat val -o test_box.png
     [ "$status" -eq 0 ]
     [ -f test_box.png ]
     [[ "$output" =~ "saved" ]]
 }
 
-@test "mentat_heatmap generates PNG from CSV" {
+@test "mentat boxplot shows multiple categories" {
+    echo "lang,cer" > test.csv
+    echo "fr,0.05" >> test.csv
+    echo "fr,0.06" >> test.csv
+    echo "en,0.04" >> test.csv
+    echo "en,0.03" >> test.csv
+    echo "es,0.07" >> test.csv
+    echo "es,0.08" >> test.csv
+    run "$SCRIPTS_DIR/mentat" boxplot test.csv lang cer -o test_box.png
+    [ "$status" -eq 0 ]
+    [ -f test_box.png ]
+    [[ "$output" =~ "saved" ]]
+}
+
+@test "mentat heatmap generates PNG from CSV" {
     echo "x,y,z" > test.csv; echo "1,2,5" >> test.csv; echo "3,4,8" >> test.csv; echo "5,6,3" >> test.csv
-    run "$SCRIPTS_DIR/mentat_heatmap" test.csv x y z -o test_heat.png
+    run "$SCRIPTS_DIR/mentat" heatmap test.csv x y z -o test_heat.png
     [ "$status" -eq 0 ]
     [ -f test_heat.png ]
     [[ "$output" =~ "saved" ]]

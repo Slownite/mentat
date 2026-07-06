@@ -9,9 +9,9 @@ CLI-driven EDA agent using DuckDB, QSV and Gnuplot. No Python libraries needed.
 
 ## Prerequisites
 
-Run `mentat_selfcheck` once at session start. Exit 0 = all good. Required: `duckdb`, `qsv`, `gnuplot`.
+Run `mentat selfcheck` once at session start. Exit 0 = all good. Required: `duckdb`, `qsv`, `gnuplot`.
 
-Scripts live in `~/.agents/skills/mentat/scripts/`. Define as `MENTAT_SCRIPTS` in session context.
+The script lives at `~/.agents/skills/mentat/scripts/mentat`. Define dir in PATH or reference directly.
 
 ## Entry Points
 
@@ -20,36 +20,36 @@ Scripts live in `~/.agents/skills/mentat/scripts/`. Define as `MENTAT_SCRIPTS` i
 
 ## Workflow
 
-Schema (`mentat_inspect <path>`, once per session) → Query or Plot.
+Schema (`mentat inspect <path>`, once per session) → Query or Plot.
 
-**Fast path:** `mentat_selfcheck` → `mentat_inspect` → `mentat_query` or `mentat_<chart_type> ... --ascii` (3-4 calls).
+**Fast path:** `mentat selfcheck` → `mentat inspect` → `mentat query` or `mentat <chart> ...` (3-4 calls).
 
 ## Schema Discovery
 
-`mentat_inspect <path>` returns compressed DDL. Cache in context. Re-inspect only on error or explicit request.
+`mentat inspect <path>` returns compressed DDL. Cache in context. Re-inspect only on error or explicit request.
 
 Use `--stats <table>` for row count, null ratios, distinct counts, value ranges — only for tables touched by current query.
 
 ## Query
 
-`mentat_query <path> <sql> [--histogram --bins=N] [--groupby <col>] [--timeseries --bucket=auto|hourly|daily|weekly|monthly|yearly] [--outlier-method=iqr|zscore] [--raw]`
+`mentat query <path> <sql> [--histogram --bins=N] [--groupby <col>] [--timeseries --bucket=auto|hourly|daily|weekly|monthly|yearly] [--outlier-method=iqr|zscore] [--raw]`
 
 Default output: `rows=N | min=X max=X mean=X median=X p25=X p75=X | outliers=N bounds=[X,Y] | sample: [...]`
 
 ## Visualization
 
-**Per-type scripts** — each does DuckDB aggregation + Gnuplot render + optional ASCII preview in one call:
+**Single entry point** — `mentat <chart-type>` does DuckDB aggregation + Gnuplot render. ASCII to stdout by default. `--output PATH` saves PNG to file (also prints ASCII for LLM validation).
 
-| Script | Use Case | Required Args |
-|--------|----------|---------------|
-| `mentat_histogram` | Distribution of 1 numeric col | datasource, column |
-| `mentat_scatter` | Correlation of 2 numeric cols | datasource, x_col, y_col |
-| `mentat_line` | Time-series trend | datasource, time_col, value_col |
-| `mentat_bar` | Categorical frequencies | datasource, category_col |
-| `mentat_boxplot` | Categorical vs numeric comparison | datasource, category_col, value_col |
-| `mentat_heatmap` | 2D density / cross-tab | datasource, x_col, y_col, z_col |
+| Subcommand | Use Case | Required Args |
+|---|---|---|
+| `mentat histogram` | Distribution of 1 numeric col | datasource, column |
+| `mentat scatter` | Correlation of 2 numeric cols | datasource, x_col, y_col |
+| `mentat line` | Time-series trend | datasource, time_col, value_col |
+| `mentat bar` | Categorical frequencies | datasource, category_col |
+| `mentat boxplot` | Categorical vs numeric comparison | datasource, category_col, value_col |
+| `mentat heatmap` | 2D density / cross-tab | datasource, x_col, y_col, z_col |
 
-Common flags: `--output PATH`, `--ascii`, `--facet COL`, `--table NAME`, `--title`, `--xlabel`, `--ylabel`.
+Common flags: `--output PATH`, `--table NAME`, `--title`, `--xlabel`, `--ylabel`.
 
 Type-specific: `--bins N` (histogram), `--bucket auto|hourly|daily|weekly|monthly|yearly` (line).
 
@@ -69,7 +69,7 @@ For large schemas (>20 tables), use keyword matching on user's question to filte
 
 ## Configuration
 
-Priority: env vars > `./mentat.config` > `~/.config/mentat/config`. See `MENTAT_TOKEN_BUDGET`, `MENTAT_MAX_RETRIES`, `MENTAT_OUTPUT_DIR`, `MENTAT_OUTLIER_METHOD`, `MENTAT_TIMESERIES_BUCKET`, `MENTAT_LOG_LEVEL`.
+Priority: env vars > `./mentat.config` > `~/.config/mentat/config`. See `MENTAT_TOKEN_BUDGET`, `MENTAT_MAX_RETRIES`, `MENTAT_OUTLIER_METHOD`, `MENTAT_TIMESERIES_BUCKET`, `MENTAT_LOG_LEVEL`.
 
 ## Data Source Rules
 
